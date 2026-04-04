@@ -36,6 +36,11 @@ TEMP_SCALE = 256.0
 IDEAL6 = np.array([0.0, 0.0, 2048.0, 0.0, 0.0, 0.0], dtype=np.float64)
 
 
+def unwrap_parallel_net(net: nn.Module) -> nn.Module:
+    """``DataParallel`` 包装时返回内部 ``module``，否则原样返回。"""
+    return net.module if hasattr(net, "module") else net
+
+
 # ---------------------------------------------------------------------------
 #  IMUNet — 多分支 PINN
 # ---------------------------------------------------------------------------
@@ -296,7 +301,8 @@ class PhysicsWarmup(dde.callbacks.Callback):
         step = self.model.train_state.step
         s = min(1.0, step / self.warmup)
         w = [self.base[0]] + [wi * s for wi in self.base[1:]]
-        self.model.loss_weights = torch.as_tensor(w, dtype=torch.float32)
+        dev = next(self.model.net.parameters()).device
+        self.model.loss_weights = torch.as_tensor(w, dtype=torch.float32, device=dev)
 
 
 # ---------------------------------------------------------------------------
@@ -396,8 +402,9 @@ def save_dde_checkpoint(model: dde.Model,
                         meta: dict[str, Any],
                         path: str) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    raw = unwrap_parallel_net(model.net)
     torch.save({
-        "model_state": model.net.state_dict(),
+        "model_state": raw.state_dict(),
         "ext_vars": [float(v.data) for v in ext_vars],
         "meta": meta,
     }, path)

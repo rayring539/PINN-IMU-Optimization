@@ -24,7 +24,13 @@ from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 
 from core.data_pipeline import parse_data_file, stratified_split_by_temp_bin_round_int
-from core.imu_data_io import DEFAULT_DATA_DIR, save_split_meta, split_train_test_by_random_file
+from core.imu_data_io import (
+    DEFAULT_DATA_DIR,
+    DEFAULT_TEST_FILES,
+    DEFAULT_TRAIN_FILES,
+    load_xy_train_test_from_dir,
+    parse_file_list_arg,
+)
 from core.pinn_model import PINN_IMU, PINNPhysicsLoss, save_pinn_checkpoint
 
 
@@ -95,6 +101,11 @@ def build_cfg() -> dict:
     ap.add_argument("--use_dTdt", type=int, default=None)
     ap.add_argument("--use_hysteresis", type=int, default=None)
     ap.add_argument("--physics_warmup", type=int, default=None)
+    ap.add_argument("--split_mode", choices=("random", "explicit"), default=None)
+    ap.add_argument("--train_files", default=None)
+    ap.add_argument("--test_files", default=None)
+    ap.add_argument("--gpus", default=None)
+    ap.add_argument("--cuda_device", type=int, default=None)
     args = ap.parse_args()
 
     # 基础配置 (若无 YAML 则用全默认)
@@ -114,6 +125,18 @@ def build_cfg() -> dict:
     c["N_used"]      = args.N_used     if args.N_used is not None else g("data", "N_used", default=-1)
     c["test_ratio"]  = args.test_ratio if args.test_ratio is not None else g("data", "test_ratio", default=0.2)
     c["seed"]        = args.seed       if args.seed is not None else g("data", "seed", default=0)
+
+    sm = args.split_mode or g("data", "split_mode", default="explicit")
+    c["split_mode"] = sm
+    tf = parse_file_list_arg(args.train_files)
+    te = parse_file_list_arg(args.test_files)
+    c["train_files"] = tf if tf is not None else g("data", "train_files", default=None)
+    c["test_files"] = te if te is not None else g("data", "test_files", default=None)
+    if c["split_mode"] == "explicit":
+        if not c["train_files"]:
+            c["train_files"] = list(DEFAULT_TRAIN_FILES)
+        if not c["test_files"]:
+            c["test_files"] = list(DEFAULT_TEST_FILES)
 
     # 传感器标度因子
     c["acc_scale"]  = g("sensor", "acc_scale",  default=2048.0)
@@ -154,6 +177,26 @@ def build_cfg() -> dict:
     # 输出
     c["out_dir"] = args.out_dir or g("output", "out_dir", default="outputs_pinn")
 
+    def _parse_gpu_ids(s):
+        if s is None:
+            return None
+        if isinstance(s, list):
+            return [int(x) for x in s]
+        s = str(s).strip()
+        if not s:
+            return None
+        return [int(x.strip()) for x in s.split(",") if x.strip()]
+
+    cli_gpus = _parse_gpu_ids(args.gpus)
+    yaml_gpus = g("training", "gpu_ids", default=None)
+    cuda_def = args.cuda_device if args.cuda_device is not None else g("training", "cuda_device", default=0)
+    if cli_gpus is not None:
+        c["gpu_ids"] = cli_gpus
+    elif yaml_gpus is not None:
+        c["gpu_ids"] = _parse_gpu_ids(yaml_gpus)
+    else:
+        c["gpu_ids"] = [int(cuda_def)]
+
     return c
 
 
@@ -179,29 +222,7 @@ def load_data(cfg: dict):
         multi = True
 
     if multi:
-        train_paths, test_path, split_meta = split_train_test_by_random_file(
-            cfg["data_dir"], cfg["seed"]
-        )
-        os.makedirs(cfg["out_dir"], exist_ok=True)
-        split_json = os.path.join(cfg["out_dir"], "train_test_split.json")
-        save_split_meta(split_meta, split_json)
-        print(f"[SPLIT] test={split_meta['test_basename']}  "
-              f"train={split_meta['train_basenames']}")
-
-        xs, ys = [], []
-        total = 0
-        n_limit = cfg["N_used"]
-        for fp in train_paths:
-            remain = None if n_limit < 0 else max(0, n_limit - total)
-            if remain is not None and remain <= 0:
-                break
-            xf, yf = parse_data_file(fp, n_lines=remain)
-            xs.append(xf); ys.append(yf); total += len(xf)
-        X_train = np.concatenate(xs)
-        y_train = np.concatenate(ys)
-
-        test_n = None if cfg["N_used"] < 0 else cfg["N_used"]
-        X_test, y_test = parse_data_file(test_path, n_lines=test_n)
+        X_train, y_train, X_test, y_test, split_meta = load_xy_train_test_from_dir(cfg)
     else:
         n_lines = None if cfg["N_used"] < 0 else cfg["N_used"]
         X_raw, y = parse_data_file(cfg["data_path"], n_lines=n_lines)
@@ -243,8 +264,23 @@ def main():
     y_mean = y_train.mean(axis=0)
     y_std  = y_train.std(axis=0) + 1e-8
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[DEVICE] {device}")
+    gpu_ids = [int(x) for x in cfg["gpu_ids"]]
+    use_dp = torch.cuda.is_available() and len(gpu_ids) > 1
+    if torch.cuda.is_available():
+        for gid in gpu_ids:
+            if gid < 0 or gid >= torch.cuda.device_count():
+                raise ValueError(
+                    f"无效 GPU id={gid}，当前可见设备数={torch.cuda.device_count()}")
+        torch.cuda.set_device(gpu_ids[0])
+        device = torch.device(f"cuda:{gpu_ids[0]}")
+    else:
+        device = torch.device("cpu")
+        use_dp = False
+
+    if use_dp:
+        print(f"[DEVICE] DataParallel  gpu_ids={gpu_ids}  主卡 {device}")
+    else:
+        print(f"[DEVICE] {device}")
 
     # ---- 模型 ----
     model = PINN_IMU(
@@ -261,7 +297,10 @@ def main():
         x_mean=x_mean, x_std=x_std,
         y_mean=y_mean, y_std=y_std,
     ).to(device)
-    n_params = print_model_summary(model)
+    if use_dp:
+        model = nn.DataParallel(model, device_ids=gpu_ids)
+    n_params = print_model_summary(
+        model.module if hasattr(model, "module") else model)
     print(f"  use_dTdt={cfg['use_dTdt']}  use_hysteresis={cfg['use_hysteresis']}")
 
     # ---- DataLoader (包含 Tdot) ----
@@ -271,7 +310,7 @@ def main():
     loader = DataLoader(
         TensorDataset(Xt, yt, Tt),
         batch_size=cfg["batch_size"], shuffle=True,
-        drop_last=False, pin_memory=(device == "cuda"),
+        drop_last=False, pin_memory=(device.type == "cuda"),
     )
 
     # ---- 优化器 ----
@@ -398,6 +437,8 @@ def _save(model, cfg, x_mean, x_std, y_mean, y_std,
             "lam": cfg["lam"],
             "physics_warmup": cfg["physics_warmup"],
             "seed": cfg["seed"],
+            "gpu_ids": cfg["gpu_ids"],
+            "split_mode": cfg.get("split_mode"),
         },
         "best_epoch": epoch,
         "test_rmse": test_rmse,

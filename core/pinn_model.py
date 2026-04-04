@@ -396,7 +396,8 @@ class PINNPhysicsLoss:
 def save_pinn_checkpoint(model: PINN_IMU, meta: dict[str, Any], path: str) -> None:
     import os
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    torch.save({"model_state": model.state_dict(), "meta": meta}, path)
+    raw = model.module if hasattr(model, "module") else model
+    torch.save({"model_state": raw.state_dict(), "meta": meta}, path)
 
 
 def load_pinn_checkpoint(

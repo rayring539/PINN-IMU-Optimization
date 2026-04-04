@@ -1,49 +1,67 @@
 # =============================================================================
-#  PINN 训练配置
-#  用法: python train_pinn.py --config config/pinn_train.yaml
+#  PINN 训练配置（PyTorch: train_pinn.py / DeepXDE: train_pinn_dde.py）
+#  用法:
+#    python train_pinn_dde.py --config config/pinn_train.yaml
+#    python train_pinn.py --config config/pinn_train.yaml
+#  CLI 可覆盖同名字段，例如: --epochs 100 --gpus 0,1,2,3
 # =============================================================================
 
 # ---- 数据 ----
 data:
   data_dir: "D:\\IMU_data"
-  # data_path: "data/1.txt"       # 单文件模式 (与 data_dir 二选一)
-  N_used: -1                       # -1 = 全部
-  test_ratio: 0.2                  # 仅单文件模式
-  seed: 0
+  # 与 data_dir 二选一: 单文件时用下面一行并注释掉 data_dir
+  # data_path: "data/1.txt"
+  N_used: -1                       # -1 = 每个文件读全量；>0 时训练集累计上限（每文件截断）
+  test_ratio: 0.2                  # 仅 split_mode: random 且走「单文件+分层划分」时有效
+  seed: 0                          # split_mode: random 时随机选测试文件用
 
-# ---- 传感器标度因子 ----
-#  数据 7 列: [acc×3, gyro×3, temp]
-#  col 0-2  加速度计  物理值(g)   = 寄存器值 / acc_scale
-#  col 3-5  陀螺仪    物理值(°/s) = 寄存器值 / gyro_scale
-#  col 6    温度      物理值(℃)   = 寄存器值 / temp_scale
+  # 划分方式:
+  #   explicit — 使用 train_files / test_files（默认 1–4 训练，5 测试）
+  #   random   — 多 .txt 中随机留一个作测试，其余训练
+  split_mode: explicit
+  train_files: ["1.txt", "2.txt", "3.txt", "4.txt"]
+  test_files: ["5.txt"]
+
+# ---- 传感器标度（寄存器 → 物理量）----
+#  7 列: [acc×3, gyro×3, temp]
+#  加速度 g = raw / acc_scale；角速度 °/s = raw / gyro_scale；温度 ℃ = raw / temp_scale
 sensor:
   acc_scale: 2048.0
   gyro_scale: 16.0
   temp_scale: 256.0
 
-# ---- 网络架构 (边缘设备友好: ~3.7K 参数 / 14 KB) ----
+# ---- 网络 ----
 model:
-  hidden_dim: 64              # 残差分支隐层宽度 (边缘: 32, 服务器: 64)
-  n_hidden: 4                 # 残差分支层数     (边缘: 3,  服务器: 4)
-  thermal_dim: 16             # 热特征分支输出维度
+  hidden_dim: 32              # 残差分支宽度（边缘可 32，服务器可 64）
+  n_hidden: 3                 # 残差分支层数
+  thermal_dim: 16             # 热特征维度
   act: "tanh"
-  use_dTdt: true
+  use_dTdt: true               # 输入是否含 Tdot（8 维）；false 为 7 维
   use_hysteresis: false
   hysteresis_hidden: 16
 
-# ---- 训练超参 ----
-#  21M 样本 × batch_size=4096 → ~5100 iter/epoch
-#  epochs=200 → 总计 ~102 万次迭代，约 1-2 小时
+# ---- 训练（DeepXDE / PyTorch 共用字段）----
 training:
-  epochs: 200
-  batch_size: 4096
+  epochs: 50
+  batch_size: 8000
   lr: 1.0e-3
   weight_decay: 1.0e-5
-  grad_clip: 5.0
-  log_interval: 10
-  physics_warmup: 30
+  grad_clip: 5.0               # 仅 train_pinn.py 使用
+  log_interval: 10             # 每隔多少个 epoch 打印/写 TensorBoard（按 iter 折算）
+  physics_warmup: 30           # 物理损失从 0 线性升到满权重的「等效 epoch」数
 
-# ---- 物理损失权重 (λ) ----
+  # Adam 之后的 L-BFGS 精调迭代数（0 = 关闭）；仅 train_pinn_dde.py
+  lbfgs_iters: 0
+
+  # 设备: gpu_ids 多于 1 个且 CUDA 可用时启用 DataParallel（主卡为 gpu_ids[0]）
+  # 单卡示例: [0] ；四卡示例: [0, 1, 2, 3]
+  gpu_ids: [0]
+  # 未配置 gpu_ids 时使用的单卡索引（或与 gpu_ids: [k] 等价）
+  cuda_device: 0
+  # true = 强制 CPU（调试用）；也可用 CLI: --cpu
+  force_cpu: false
+
+# ---- 物理损失权重 λ ----
 physics_loss:
   L_heat_smooth: 1.0e-2
   L_physics_prior: 1.0e-1
@@ -54,12 +72,12 @@ physics_loss:
   L_residual_small: 1.0e-3
   L_grad_smooth: 1.0e-3
 
-# ---- 可学习物理参数先验 ----
+# ---- 可学习物理参数先验（文档用；反演权重在 physics_loss）----
 physics_priors:
   k_E_ppm: 60.0
   alpha_ppm: 2.6
   delta_alpha_ppm: 5.0
 
-# ---- 输出 (模型 + TensorBoard 日志) ----
+# ---- 输出目录（checkpoint / TensorBoard / ONNX / split json）----
 output:
   out_dir: "D:\\IMU_output"

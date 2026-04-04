@@ -10,6 +10,9 @@ PINN 训练入口 (DeepXDE 版)。
 用法:
   python train_pinn_dde.py --config config/pinn_train.yaml
   python train_pinn_dde.py --config config/pinn_train.yaml --epochs 500
+  python train_pinn_dde.py --config config/pinn_train.yaml --cpu   # 强制 CPU
+  python train_pinn_dde.py --config config/pinn_train.yaml --gpus 0,1,2,3
+  python train_pinn_dde.py --split_mode explicit --train_files 1.txt,2.txt,3.txt,4.txt --test_files 5.txt
 """
 from __future__ import annotations
 
@@ -31,19 +34,22 @@ os.environ.setdefault("DDE_BACKEND", "pytorch")
 
 import deepxde as dde  # noqa: E402
 import torch  # noqa: E402
+import torch.nn as nn  # noqa: E402
 
 from core.pinn_dde import (  # noqa: E402
     ACC_SCALE, GYRO_SCALE, TEMP_SCALE,
     IMUNet, IMUPINNData, PhysicsWarmup, ProgressBar, TensorBoardCallback,
-    save_dde_checkpoint, export_onnx,
+    export_onnx, save_dde_checkpoint, unwrap_parallel_net,
 )
 from core.data_pipeline import (  # noqa: E402
     parse_data_file,
     stratified_split_by_temp_bin_round_int,
 )
 from core.imu_data_io import (  # noqa: E402
-    save_split_meta,
-    split_train_test_by_random_file,
+    DEFAULT_TEST_FILES,
+    DEFAULT_TRAIN_FILES,
+    load_xy_train_test_from_dir,
+    parse_file_list_arg,
 )
 
 
@@ -88,6 +94,18 @@ def build_cfg() -> dict:
     ap.add_argument("--out_dir", default=None)
     ap.add_argument("--lbfgs_iters", type=int, default=None,
                     help="Adam 后接 L-BFGS 精调迭代数 (0=禁用)")
+    ap.add_argument("--cpu", action="store_true",
+                    help="强制使用 CPU（默认在可用时使用 CUDA）")
+    ap.add_argument("--cuda_device", type=int, default=None,
+                    help="单卡训练时的 GPU 索引（默认 0；多卡请用 --gpus）")
+    ap.add_argument("--gpus", default=None,
+                    help="多卡 DataParallel，逗号分隔 GPU 索引，如 0,1,2,3")
+    ap.add_argument("--split_mode", choices=("random", "explicit"), default=None,
+                    help="数据划分: random=随机留一文件作测试; explicit=用 train_files/test_files")
+    ap.add_argument("--train_files", default=None,
+                    help="显式训练文件，逗号分隔，如 1.txt,2.txt,3.txt,4.txt")
+    ap.add_argument("--test_files", default=None,
+                    help="显式测试文件，逗号分隔，如 5.txt")
     args = ap.parse_args()
 
     cfg: dict = {}
@@ -103,6 +121,18 @@ def build_cfg() -> dict:
     c["N_used"]     = args.N_used    if args.N_used is not None else g("data", "N_used", default=-1)
     c["test_ratio"] = g("data", "test_ratio", default=0.2)
     c["seed"]       = g("data", "seed", default=0)
+
+    sm = args.split_mode or g("data", "split_mode", default="explicit")
+    c["split_mode"] = sm
+    tf = parse_file_list_arg(args.train_files)
+    te = parse_file_list_arg(args.test_files)
+    c["train_files"] = tf if tf is not None else g("data", "train_files", default=None)
+    c["test_files"] = te if te is not None else g("data", "test_files", default=None)
+    if c["split_mode"] == "explicit":
+        if not c["train_files"]:
+            c["train_files"] = list(DEFAULT_TRAIN_FILES)
+        if not c["test_files"]:
+            c["test_files"] = list(DEFAULT_TEST_FILES)
 
     c["acc_scale"]  = g("sensor", "acc_scale",  default=ACC_SCALE)
     c["gyro_scale"] = g("sensor", "gyro_scale", default=GYRO_SCALE)
@@ -137,6 +167,27 @@ def build_cfg() -> dict:
     }
 
     c["out_dir"] = args.out_dir or g("output", "out_dir", default="D:\\IMU_output")
+    c["force_cpu"] = bool(args.cpu) or bool(g("training", "force_cpu", default=False))
+
+    def _parse_gpu_ids(s: str | list | None) -> list[int] | None:
+        if s is None:
+            return None
+        if isinstance(s, list):
+            return [int(x) for x in s]
+        s = str(s).strip()
+        if not s:
+            return None
+        return [int(x.strip()) for x in s.split(",") if x.strip()]
+
+    cli_gpus = _parse_gpu_ids(args.gpus)
+    yaml_gpus = g("training", "gpu_ids", default=None)
+    cuda_def = args.cuda_device if args.cuda_device is not None else g("training", "cuda_device", default=0)
+    if cli_gpus is not None:
+        c["gpu_ids"] = cli_gpus
+    elif yaml_gpus is not None:
+        c["gpu_ids"] = _parse_gpu_ids(yaml_gpus)
+    else:
+        c["gpu_ids"] = [int(cuda_def)]
     return c
 
 
@@ -145,22 +196,7 @@ def build_cfg() -> dict:
 # -----------------------------------------------------------------------
 def load_data(cfg: dict):
     if cfg.get("data_dir"):
-        train_paths, test_path, split_meta = split_train_test_by_random_file(
-            cfg["data_dir"], seed=cfg["seed"])
-        os.makedirs(cfg["out_dir"], exist_ok=True)
-        save_split_meta(split_meta,
-                        os.path.join(cfg["out_dir"], "train_test_split.json"))
-        xs, ys, total = [], [], 0
-        n_limit = cfg["N_used"]
-        for fp in train_paths:
-            remain = None if n_limit < 0 else max(0, n_limit - total)
-            if remain is not None and remain <= 0:
-                break
-            xf, yf = parse_data_file(fp, n_lines=remain)
-            xs.append(xf); ys.append(yf); total += len(xf)
-        X_train, y_train = np.concatenate(xs), np.concatenate(ys)
-        test_n = None if cfg["N_used"] < 0 else cfg["N_used"]
-        X_test, y_test = parse_data_file(test_path, n_lines=test_n)
+        X_train, y_train, X_test, y_test, _ = load_xy_train_test_from_dir(cfg)
     else:
         n_lines = None if cfg["N_used"] < 0 else cfg["N_used"]
         X_raw, y = parse_data_file(cfg["data_path"], n_lines=n_lines)
@@ -203,12 +239,53 @@ def main():
     # ---- DeepXDE Data ----
     data = IMUPINNData(X_train_aug, y_train, X_test_aug, y_test)
 
+    # ---- 设备 (GPU: 将 NumPy batch 与模型对齐到同一 device，见 deepxde model.py 补丁) ----
+    gpu_ids = [int(x) for x in cfg["gpu_ids"]]
+    use_dp = (
+        not cfg["force_cpu"]
+        and torch.cuda.is_available()
+        and len(gpu_ids) > 1
+    )
+    if cfg["force_cpu"]:
+        device = torch.device("cpu")
+    elif torch.cuda.is_available():
+        for gid in gpu_ids:
+            if gid < 0 or gid >= torch.cuda.device_count():
+                raise ValueError(
+                    f"无效 GPU id={gid}，当前可见设备数={torch.cuda.device_count()}")
+        primary = int(gpu_ids[0])
+        torch.cuda.set_device(primary)
+        device = torch.device(f"cuda:{primary}")
+    else:
+        device = torch.device("cpu")
+        use_dp = False
+        print(
+            "[DEVICE] 未检测到 CUDA（torch.cuda.is_available()=False）。"
+            "若已安装 NVIDIA 驱动，请安装带 CUDA 的 PyTorch: "
+            "https://pytorch.org/get-started/locally/"
+        )
+
     # ---- Network ----
     net = IMUNet(cfg, x_mean, x_std, y_std)
     if cfg["weight_decay"] > 0:
         net.regularizer = ("l2", cfg["weight_decay"])
+    net = net.to(device)
+    if use_dp:
+        net = nn.DataParallel(net, device_ids=gpu_ids)
 
-    n_params = net.num_trainable_parameters()
+    if device.type == "cuda":
+        pname = torch.cuda.get_device_name(device)
+        cap = torch.cuda.get_device_capability(device)
+        if use_dp:
+            print(
+                f"[DEVICE] DataParallel  gpu_ids={gpu_ids}  主卡 {device}  {pname}  (cap {cap})"
+            )
+        else:
+            print(f"[DEVICE] {device}  {pname}  (cap {cap})")
+    else:
+        print("[DEVICE] cpu")
+
+    n_params = unwrap_parallel_net(net).num_trainable_parameters()
     kb = n_params * 4 / 1024
     groups: dict[str, int] = {}
     for name, p in net.named_parameters():
@@ -238,6 +315,7 @@ def main():
     log_alpha = dde.Variable(math.log(2.6e-6))
     log_da    = dde.Variable(math.log(5e-6))
     ext_vars  = [log_k_E, log_alpha, log_da]
+    ext_vars = [t.detach().to(device).requires_grad_(True) for t in ext_vars]
 
     # ---- dde.Model ----
     model = dde.Model(data, net)
@@ -355,6 +433,8 @@ def main():
             "batch_size": bs,
             "lam": cfg["lam"],
             "lbfgs_iters": lbfgs_iters,
+            "gpu_ids": cfg["gpu_ids"],
+            "split_mode": cfg.get("split_mode"),
         },
         "best_step": int(train_state.best_step),
         "best_loss": float(sum(train_state.best_loss_test)),
@@ -368,7 +448,7 @@ def main():
 
     # ---- ONNX 导出 (用于量化 / 边缘部署) ----
     onnx_path = os.path.join(out_dir, "pinn_model.onnx")
-    export_onnx(model.net, onnx_path)
+    export_onnx(unwrap_parallel_net(model.net), onnx_path)
 
 
 if __name__ == "__main__":

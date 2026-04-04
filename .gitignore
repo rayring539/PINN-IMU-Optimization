@@ -14,17 +14,34 @@ env/
 # IDE / OS
 .idea/
 .vscode/
+.cursor/
 .DS_Store
 Thumbs.db
 
-# 训练产物 / 大文件（勿提交）
+# 训练与运行产物（勿提交）
 *.pt
 *.onnx
+*.log
+tb/
+outputs/
+outputs_stream_test/
 outputs_pinn/
 outputs_pinn_dde/
-tb/
-*.log
 
-# 本地数据与文档（体积大）
-*.docx
+# 数据与本地输出目录
 data/
+*.docx
+*.csv
+*.npy
+*.npz
+*.mat
+
+# 根目录杂项二进制（论文/插图等非代码）
+*.pdf
+# 本地长文框架说明（仓库以 README 为准）
+IMU_Temperature_Drift_PINN_Framework.md
+
+# DeepXDE 仅需 Python 包本体；文档与示例体积大且非运行必需
+deepxde/docs/
+deepxde/examples/
+deepxde/docker/

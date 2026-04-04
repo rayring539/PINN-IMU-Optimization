@@ -304,13 +304,17 @@ class Model:
 
         def outputs(training, inputs):
             self.net.train(mode=training)
+            dev = next(self.net.parameters()).device
             with torch.no_grad():
                 if isinstance(inputs, tuple):
                     inputs = tuple(
-                        map(lambda x: torch.as_tensor(x).requires_grad_(), inputs)
+                        map(
+                            lambda x: torch.as_tensor(x, device=dev).requires_grad_(),
+                            inputs,
+                        )
                     )
                 else:
-                    inputs = torch.as_tensor(inputs)
+                    inputs = torch.as_tensor(inputs, device=dev)
                     inputs.requires_grad_()
             # Clear cached Jacobians and Hessians.
             grad.clear()
@@ -318,20 +322,24 @@ class Model:
 
         def outputs_losses(training, inputs, targets, auxiliary_vars, losses_fn):
             self.net.auxiliary_vars = None
+            dev = next(self.net.parameters()).device
             if auxiliary_vars is not None:
-                self.net.auxiliary_vars = torch.as_tensor(auxiliary_vars)
+                self.net.auxiliary_vars = torch.as_tensor(auxiliary_vars, device=dev)
             self.net.train(mode=training)
             if isinstance(inputs, tuple):
                 inputs = tuple(
-                    map(lambda x: torch.as_tensor(x).requires_grad_(), inputs)
+                    map(
+                        lambda x: torch.as_tensor(x, device=dev).requires_grad_(),
+                        inputs,
+                    )
                 )
             else:
-                inputs = torch.as_tensor(inputs)
+                inputs = torch.as_tensor(inputs, device=dev)
                 inputs.requires_grad_()
             outputs_ = self.net(inputs)
             # Data losses
             if targets is not None:
-                targets = torch.as_tensor(targets)
+                targets = torch.as_tensor(targets, device=dev)
             # if forward-mode AD is used, then a forward call needs to be passed
             aux = [self.net] if config.autodiff == "forward" else None
             losses = losses_fn(targets, outputs_, loss_fn, inputs, self, aux=aux)
@@ -340,7 +348,7 @@ class Model:
             losses = torch.stack(losses)
             # Weighted losses
             if self.loss_weights is not None:
-                losses *= torch.as_tensor(self.loss_weights)
+                losses *= torch.as_tensor(self.loss_weights, device=dev)
             if l1_factor > 0:
                 l1_loss = l1_factor * torch.sum(
                     torch.stack([torch.sum(p.abs()) for p in self.net.parameters()])
@@ -991,10 +999,13 @@ class Model:
             y = utils.to_numpy(y)
         elif backend_name == "pytorch":
             self.net.eval()
+            dev = next(self.net.parameters()).device
             if isinstance(x, tuple):
-                inputs = tuple(map(lambda x: torch.as_tensor(x).requires_grad_(), x))
+                inputs = tuple(
+                    map(lambda t: torch.as_tensor(t, device=dev).requires_grad_(), x)
+                )
             else:
-                inputs = torch.as_tensor(x).requires_grad_()
+                inputs = torch.as_tensor(x, device=dev).requires_grad_()
             outputs = self.net(inputs)
             if utils.get_num_args(operator) == 2:
                 if config.autodiff == "forward":
