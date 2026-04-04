@@ -41,6 +41,9 @@ data/
 # 本地长文框架说明（仓库以 README 为准）
 IMU_Temperature_Drift_PINN_Framework.md
 
+# 其他本地项目（不属于本仓库）
+Monsterl-ite/
+
 # DeepXDE 仅需 Python 包本体；文档与示例体积大且非运行必需
 deepxde/docs/
 deepxde/examples/

@@ -400,6 +400,7 @@ class Model:
                 total_loss = torch.sum(losses)
                 self.opt.zero_grad()
                 total_loss.backward()
+                self._step_losses = losses.detach().cpu().numpy()
                 return total_loss
 
             def closure_mixed():

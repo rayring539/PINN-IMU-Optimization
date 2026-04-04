@@ -39,7 +39,7 @@ IMU/
 
 ## 数据格式
 
-- 文本文件，每行 7 列（无表头），制表符或空格分隔：  
+- 文本文件，每行 7 列（无表头），制表符或空格分隔：
   `[ax, ay, az, gx, gy, gz, T_raw]`（与 `config` 中 `sensor` 标度一致）。
 - 配置中 `data.data_dir` 指向数据目录；默认 **explicit** 划分见 `config/pinn_train.yaml` 中 `train_files` / `test_files`。
 
@@ -66,7 +66,14 @@ python train_pinn_dde.py --config config/pinn_train.yaml --epochs 100 --gpus 0,1
 python train_pinn_dde.py --split_mode explicit --train_files "1.txt,2.txt,3.txt,4.txt" --test_files "5.txt"
 ```
 
-产出（在 `out_dir`）：`pinn_model_best.pt`、`pinn_model.onnx`、`train_test_split.json`、TensorBoard 日志目录 `tb/` 等。
+后台训练（服务器推荐）：
+
+```bash
+nohup python train_pinn_dde.py --config config/pinn_train.yaml > train.log 2>&1 &
+tail -f train.log
+```
+
+产出（在 `out_dir`）：`pinn_model_best.pt`、`pinn_model.onnx`、`train_test_split.json`、TensorBoard 日志 `tb/run_*` 等。
 
 ### 3. 评测与可视化
 
@@ -83,9 +90,43 @@ python tools/export_onnx.py --ckpt <out_dir>/pinn_model_best.pt
 
 ## TensorBoard
 
+每次训练自动在 `<out_dir>/tb/run_<时间戳>/` 下创建独立日志，多次训练不会互相覆盖。
+
 ```bash
 tensorboard --logdir <out_dir>/tb
 ```
+
+远程服务器通过 SSH 端口转发查看：
+
+```bash
+ssh -L 6006:127.0.0.1:6006 user@server -p <port> -i <key>
+tensorboard --logdir <out_dir>/tb --port 6006 --host 127.0.0.1
+# 本机浏览器打开 http://127.0.0.1:6006
+```
+
+TensorBoard 面板说明：
+
+| 标量组 | 含义 | 更新频率 |
+|--------|------|----------|
+| `train/*` | 训练集各项 loss（data、physics 子项、total） | 每个优化步 |
+| `train/lr` | 学习率 | 每个优化步 |
+| `val/*` | 验证集各项 loss | 每 `log_interval` 个 epoch |
+| `meta/epoch` | 近似 epoch 数 | 每个优化步 |
+
+## 配置说明
+
+关键训练参数（`config/pinn_train.yaml`）：
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `training.epochs` | 训练轮数 | 50 |
+| `training.batch_size` | 批大小 | 8000 |
+| `training.lr` | 初始学习率 | 1e-3 |
+| `training.log_interval` | 每 N 个 epoch 做一次验证 | 1 |
+| `training.save_best_checkpoint_only` | 仅保存验证 loss 最优的 checkpoint | false |
+| `training.physics_warmup` | 物理损失从 0 升至满权重的 epoch 数 | 30 |
+| `training.lbfgs_iters` | Adam 后 L-BFGS 精调步数（0=关闭） | 0 |
+| `training.gpu_ids` | GPU 索引列表 | [0] |
 
 ## 说明
 
