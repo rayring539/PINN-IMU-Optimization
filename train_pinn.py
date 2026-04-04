@@ -6,7 +6,8 @@ PINN 训练入口 v2。
 用法:
   python train_pinn.py --config config/pinn_train.yaml
   python train_pinn.py --config config/pinn_train.yaml --epochs 500
-  python train_pinn.py --data_dir D:\\IMU_data --epochs 300   # 无 YAML 也可
+  python train_pinn.py --data_dir /path/to/IMU_data --epochs 300   # 无 YAML 也可
+  python train_pinn.py --data_dir D:\\IMU_data --epochs 300         # Windows
 """
 from __future__ import annotations
 
@@ -14,7 +15,6 @@ import argparse
 import json
 import os
 import time
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -77,6 +77,29 @@ def _deep_get(d: dict, *keys, default=None):
             return default
         d = d.get(k, default)
     return d
+
+
+def _coerce_int(val, field: str) -> int:
+    """YAML 中若写 2048*10 会得到字符串；统一转为 int。"""
+    if isinstance(val, bool):
+        raise TypeError(f"{field}: 需要整数，不要用 YAML 布尔值")
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        return int(val)
+    if isinstance(val, str):
+        s = "".join(val.split())
+        if not s:
+            raise ValueError(f"{field}: 空字符串")
+        if "*" in s:
+            p = 1
+            for part in s.split("*"):
+                if not part:
+                    raise ValueError(f"{field}: 无效的乘法表达式 {val!r}")
+                p *= int(float(part))
+            return p
+        return int(float(s))
+    raise TypeError(f"{field}: 需要整数，得到 {type(val).__name__}")
 
 
 def build_cfg() -> dict:
@@ -151,6 +174,7 @@ def build_cfg() -> dict:
     c["use_dTdt"]         = bool(args.use_dTdt) if args.use_dTdt is not None else g("model", "use_dTdt", default=True)
     c["use_hysteresis"]   = bool(args.use_hysteresis) if args.use_hysteresis is not None else g("model", "use_hysteresis", default=False)
     c["hysteresis_hidden"] = g("model", "hysteresis_hidden", default=16)
+    c["temp_only"]        = bool(g("model", "temp_only", default=False))
 
     # 训练
     c["epochs"]          = args.epochs     if args.epochs is not None else g("training", "epochs", default=300)
@@ -195,8 +219,18 @@ def build_cfg() -> dict:
     elif yaml_gpus is not None:
         c["gpu_ids"] = _parse_gpu_ids(yaml_gpus)
     else:
-        c["gpu_ids"] = [int(cuda_def)]
+        c["gpu_ids"] = [_coerce_int(cuda_def, "training.cuda_device")]
 
+    c["N_used"] = _coerce_int(c["N_used"], "data.N_used")
+    c["seed"] = _coerce_int(c["seed"], "data.seed")
+    c["epochs"] = _coerce_int(c["epochs"], "training.epochs")
+    c["batch_size"] = _coerce_int(c["batch_size"], "training.batch_size")
+    c["physics_warmup"] = _coerce_int(c["physics_warmup"], "training.physics_warmup")
+    c["log_interval"] = _coerce_int(c["log_interval"], "training.log_interval")
+    c["hidden_dim"] = _coerce_int(c["hidden_dim"], "model.hidden_dim")
+    c["n_hidden"] = _coerce_int(c["n_hidden"], "model.n_hidden")
+    c["thermal_dim"] = _coerce_int(c["thermal_dim"], "model.thermal_dim")
+    c["hysteresis_hidden"] = _coerce_int(c["hysteresis_hidden"], "model.hysteresis_hidden")
     return c
 
 
@@ -213,27 +247,30 @@ def compute_dTdt(T: np.ndarray) -> np.ndarray:
 
 
 def load_data(cfg: dict):
-    """返回 X_train, y_train, Tdot_train, X_test, y_test, Tdot_test, split_meta, raw_min, raw_max"""
-    multi = cfg["data_path"] is None
-    if not multi:
-        multi = False
-    elif cfg["data_dir"] is None:
-        cfg["data_dir"] = DEFAULT_DATA_DIR
-        multi = True
+    """加载数据并计算各集合上的 dT/dt。
 
-    if multi:
-        X_train, y_train, X_test, y_test, split_meta = load_xy_train_test_from_dir(cfg)
-    else:
+    - 若配置 ``data_path``：单文件 + 按温度分层划分 train/test。
+    - 否则：多文件目录 ``data_dir``（未设则用 ``DEFAULT_DATA_DIR``），走 explicit/random。
+
+    需在调用前保证 ``cfg['out_dir']`` 已存在（``load_xy_train_test_from_dir`` 会写划分元数据）。
+    返回 (X_train, y_train, Tdot_train, X_test, y_test, Tdot_test, split_meta)。
+    """
+    if cfg.get("data_path"):
         n_lines = None if cfg["N_used"] < 0 else cfg["N_used"]
         X_raw, y = parse_data_file(cfg["data_path"], n_lines=n_lines)
         X_train, y_train, X_test, y_test = stratified_split_by_temp_bin_round_int(
             X_raw, y, test_ratio=cfg["test_ratio"], seed=cfg["seed"]
         )
         split_meta = None
+    else:
+        if not cfg.get("data_dir"):
+            cfg["data_dir"] = DEFAULT_DATA_DIR
+        X_train, y_train, X_test, y_test, split_meta = load_xy_train_test_from_dir(
+            cfg
+        )
 
-    # dT/dt (训练集和测试集分别计算)
     Tdot_train = compute_dTdt(X_train[:, 6])
-    Tdot_test  = compute_dTdt(X_test[:, 6])
+    Tdot_test = compute_dTdt(X_test[:, 6])
 
     return X_train, y_train, Tdot_train, X_test, y_test, Tdot_test, split_meta
 
@@ -291,6 +328,7 @@ def main():
         use_dTdt=cfg["use_dTdt"],
         use_hysteresis=cfg["use_hysteresis"],
         hysteresis_hidden=cfg["hysteresis_hidden"],
+        temp_only=cfg.get("temp_only", False),
         acc_scale=cfg["acc_scale"],
         gyro_scale=cfg["gyro_scale"],
         temp_scale=cfg["temp_scale"],
@@ -301,7 +339,8 @@ def main():
         model = nn.DataParallel(model, device_ids=gpu_ids)
     n_params = print_model_summary(
         model.module if hasattr(model, "module") else model)
-    print(f"  use_dTdt={cfg['use_dTdt']}  use_hysteresis={cfg['use_hysteresis']}")
+    print(f"  use_dTdt={cfg['use_dTdt']}  use_hysteresis={cfg['use_hysteresis']}  "
+          f"temp_only={cfg.get('temp_only', False)}")
 
     # ---- DataLoader (包含 Tdot) ----
     Xt = torch.from_numpy(X_train.astype(np.float32))
@@ -324,7 +363,9 @@ def main():
     best_test_rmse = float("inf")
     t0 = time.time()
 
-    tb_dir = os.path.join(cfg["out_dir"], "tb")
+    tb_dir = os.path.join(
+        cfg["out_dir"], "tb", f"run_{time.strftime('%Y%m%d_%H%M%S')}"
+    )
     writer = SummaryWriter(log_dir=tb_dir)
     print(f"[TB] TensorBoard log → {tb_dir}")
 
@@ -368,15 +409,18 @@ def main():
             nb += 1
 
         scheduler.step()
+        lr_now = scheduler.get_last_lr()[0]
         avg_d = ep_data / max(nb, 1)
         avg_p = ep_phys / max(nb, 1)
 
-        # ---- TensorBoard: 每 epoch 写 loss ----
-        writer.add_scalar("loss/data", avg_d, epoch)
-        writer.add_scalar("loss/physics_total", avg_p, epoch)
-        writer.add_scalar("loss/total", avg_d + avg_p, epoch)
+        # ---- TensorBoard: 每 epoch 写 loss / meta / lr ----
+        writer.add_scalar("train/data", avg_d, epoch)
+        writer.add_scalar("train/physics_total", avg_p, epoch)
+        writer.add_scalar("train/total", avg_d + avg_p, epoch)
+        writer.add_scalar("meta/epoch", float(epoch), epoch)
+        writer.add_scalar("train/lr", lr_now, epoch)
         for k, v in ep_terms.items():
-            writer.add_scalar(f"physics/{k}", v / max(nb, 1), epoch)
+            writer.add_scalar(f"train/physics_{k}", v / max(nb, 1), epoch)
 
         # ---- 验证 ----
         do_log = (epoch % cfg["log_interval"] == 0
@@ -390,13 +434,11 @@ def main():
             corr_pred = X_test[:, :6] + delta_test
             test_rmse = float(np.sqrt(np.mean((corr_pred - corr_true) ** 2)))
 
-            lr_now = scheduler.get_last_lr()[0]
             print(f"[E{epoch:04d}] data={avg_d:.4f}  phys={avg_p:.6f}  "
                   f"test_rmse={test_rmse:.4f}  lr={lr_now:.2e}  "
                   f"elapsed={time.time()-t0:.1f}s")
 
-            writer.add_scalar("metrics/test_rmse", test_rmse, epoch)
-            writer.add_scalar("lr", lr_now, epoch)
+            writer.add_scalar("test/rmse_lsb", test_rmse, epoch)
 
             if test_rmse < best_test_rmse:
                 best_test_rmse = test_rmse
@@ -405,10 +447,11 @@ def main():
 
     _save(model, cfg, x_mean, x_std, y_mean, y_std,
           split_meta, cfg["epochs"], best_test_rmse, "final")
+    writer.flush()
     writer.close()
     print(f"[DONE] best_test_rmse={best_test_rmse:.4f}  "
           f"elapsed={time.time()-t0:.1f}s")
-    print(f"[TB] tensorboard --logdir {tb_dir}")
+    print(f"[TB] tensorboard --logdir {os.path.join(cfg['out_dir'], 'tb')}")
 
 
 def _save(model, cfg, x_mean, x_std, y_mean, y_std,
@@ -422,6 +465,7 @@ def _save(model, cfg, x_mean, x_std, y_mean, y_std,
             "use_dTdt": cfg["use_dTdt"],
             "use_hysteresis": cfg["use_hysteresis"],
             "hysteresis_hidden": cfg["hysteresis_hidden"],
+            "temp_only": bool(cfg.get("temp_only", False)),
             "acc_scale": cfg["acc_scale"],
             "gyro_scale": cfg["gyro_scale"],
             "temp_scale": cfg["temp_scale"],

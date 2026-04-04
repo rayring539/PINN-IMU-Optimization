@@ -16,6 +16,7 @@ import numpy as np
 import torch
 
 from core.data_pipeline import parse_data_file
+from core.pinn_metrics import summarize_delta_metrics
 from core.pinn_model import ACC_SCALE, GYRO_SCALE, TEMP_SCALE, load_pinn_checkpoint
 
 
@@ -45,7 +46,10 @@ def main():
     ap.add_argument("--test_data_path", default=None)
     ap.add_argument("--data_path", default=None)
     ap.add_argument("--N_used", type=int, default=-1)
-    ap.add_argument("--eps", type=float, default=5.0)
+    ap.add_argument("--eps", type=float, default=5.0,
+                    help="coverage 阈值：各轴 |error|≤eps 的样本比例（与 bad 互补视角）")
+    ap.add_argument("--bad_x", type=float, default=None,
+                    help="bad 阈值 (LSB)：任一分量 |error|>bad_x 计为坏样本；默认与 --eps 相同")
     ap.add_argument("--device", default="cpu")
     args = ap.parse_args()
 
@@ -86,6 +90,9 @@ def main():
     mae_vals, rmse_vals = mae_rmse(corr_true, corr_pred)
     cov_vals = coverage(corr_true, corr_pred, args.eps)
 
+    bad_x = float(args.bad_x) if args.bad_x is not None else float(args.eps)
+    # δ 空间：6 轴各自 RMSE/bad + 总 RMSE + 总 bad（与 train_pinn_dde metrics 一致）
+    delta_lsb = summarize_delta_metrics(y_test, delta_pred, bad_x)
     # 物理单位指标 (g for acc, °/s for gyro)
     err_lsb = corr_pred - corr_true
     err_phys = np.copy(err_lsb)
@@ -114,7 +121,9 @@ def main():
         "N_used": int(args.N_used),
         "N_test": int(len(X_test)),
         "eps": float(args.eps),
+        "bad_x": bad_x,
         "sensor_scales": {"acc": asc, "gyro": gsc},
+        "delta_lsb": delta_lsb,
         "metrics_corrected_lsb": {
             "mae_per_dim": mae_vals,
             "rmse_per_dim": rmse_vals,
@@ -138,7 +147,7 @@ def main():
     safe = os.path.splitext(os.path.basename(test_path))[0]
     out_path = os.path.join(
         os.path.dirname(args.model_path) or "outputs_pinn",
-        f"pinn_eval_eps{args.eps}_test_{safe}.json",
+        f"pinn_eval_bad{bad_x}_eps{args.eps}_test_{safe}.json",
     )
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:

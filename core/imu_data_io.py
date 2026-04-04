@@ -10,7 +10,8 @@ from typing import Any
 
 import numpy as np
 
-DEFAULT_DATA_DIR = r"D:\IMU_data"
+# 无 --config / 未在 YAML 中写 data_dir 时的默认目录（可按本机修改）
+DEFAULT_DATA_DIR = "/home/leiyilin/IMU_data"
 
 # 默认显式划分：1–4 训练，5 测试（与常见扫温实验一致）
 DEFAULT_TRAIN_FILES = ["1.txt", "2.txt", "3.txt", "4.txt"]

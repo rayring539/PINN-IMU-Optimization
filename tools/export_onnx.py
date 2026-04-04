@@ -37,7 +37,8 @@ def main():
     print(f"[CKPT] {args.ckpt}")
     print(f"       params={n_params:,d}  ({n_params * 4 / 1024:.1f} KB float32)")
     print(f"       use_dTdt={hp.get('use_dTdt', True)}  "
-          f"use_hysteresis={hp.get('use_hysteresis', False)}")
+          f"use_hysteresis={hp.get('use_hysteresis', False)}  "
+          f"temp_only={hp.get('temp_only', False)}")
 
     if args.out is None:
         out_dir = os.path.dirname(args.ckpt) or "."

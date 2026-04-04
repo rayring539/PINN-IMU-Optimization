@@ -291,15 +291,18 @@ class Model:
     def _compile_pytorch(self, lr, loss_fn, decay):
         """pytorch"""
 
+        # DataParallel / DistributedDataParallel 不转发 regularizer、auxiliary_vars 等自定义属性
+        _net = self.net.module if hasattr(self.net, "module") else self.net
+
         l1_factor, l2_factor = 0, 0
-        if self.net.regularizer is not None:
-            if self.net.regularizer[0] == "l1":
-                l1_factor = self.net.regularizer[1]
-            elif self.net.regularizer[0] == "l2":
-                l2_factor = self.net.regularizer[1]
+        if _net.regularizer is not None:
+            if _net.regularizer[0] == "l1":
+                l1_factor = _net.regularizer[1]
+            elif _net.regularizer[0] == "l2":
+                l2_factor = _net.regularizer[1]
             else:
                 raise NotImplementedError(
-                    f"{self.net.regularizer[0]} regularizer hasn't been implemented for backend pytorch."
+                    f"{_net.regularizer[0]} regularizer hasn't been implemented for backend pytorch."
                 )
 
         def outputs(training, inputs):
@@ -321,10 +324,10 @@ class Model:
             return self.net(inputs)
 
         def outputs_losses(training, inputs, targets, auxiliary_vars, losses_fn):
-            self.net.auxiliary_vars = None
+            _net.auxiliary_vars = None
             dev = next(self.net.parameters()).device
             if auxiliary_vars is not None:
-                self.net.auxiliary_vars = torch.as_tensor(auxiliary_vars, device=dev)
+                _net.auxiliary_vars = torch.as_tensor(auxiliary_vars, device=dev)
             self.net.train(mode=training)
             if isinstance(inputs, tuple):
                 inputs = tuple(

@@ -75,6 +75,7 @@ class PINN_IMU(nn.Module):
         use_dTdt: bool = True,
         use_hysteresis: bool = False,
         hysteresis_hidden: int = 16,
+        temp_only: bool = False,
         acc_scale: float = ACC_SCALE,
         gyro_scale: float = GYRO_SCALE,
         temp_scale: float = TEMP_SCALE,
@@ -86,6 +87,7 @@ class PINN_IMU(nn.Module):
         super().__init__()
         self.use_dTdt = use_dTdt
         self.use_hysteresis = use_hysteresis
+        self.temp_only = temp_only
 
         # ---- 标度因子 ----
         self.register_buffer("acc_scale",  torch.tensor(acc_scale,  dtype=torch.float32))
@@ -230,6 +232,8 @@ class PINN_IMU(nn.Module):
 
         # ---- 残差分支 ----
         raw6_norm = (raw6 - self.x_mean[:6]) / self.x_std[:6]
+        if self.temp_only:
+            raw6_norm = torch.zeros_like(raw6_norm)
         res_input = torch.cat([raw6_norm, thermal_feat], dim=1)
         residual  = self.residual_net(res_input) * self.y_std
 
@@ -415,6 +419,7 @@ def load_pinn_checkpoint(
         use_dTdt=hp.get("use_dTdt", True),
         use_hysteresis=hp.get("use_hysteresis", False),
         hysteresis_hidden=hp.get("hysteresis_hidden", 16),
+        temp_only=hp.get("temp_only", False),
         acc_scale=hp.get("acc_scale", ACC_SCALE),
         gyro_scale=hp.get("gyro_scale", GYRO_SCALE),
         temp_scale=hp.get("temp_scale", TEMP_SCALE),

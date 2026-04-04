@@ -8,7 +8,8 @@
 
 # ---- 数据 ----
 data:
-  data_dir: "D:\\IMU_data"
+  # Linux/macOS 示例: "./data" 或 "/home/you/IMU_data"；Windows 可用 "D:\\IMU_data"
+  data_dir: "/home/leiyilin/IMU_data"
   # 与 data_dir 二选一: 单文件时用下面一行并注释掉 data_dir
   # data_path: "data/1.txt"
   N_used: -1                       # -1 = 每个文件读全量；>0 时训练集累计上限（每文件截断）
@@ -39,11 +40,15 @@ model:
   use_dTdt: true               # 输入是否含 Tdot（8 维）；false 为 7 维
   use_hysteresis: false
   hysteresis_hidden: 16
+  # false: 残差分支使用 raw6（与当前默认一致）
+  # true:  仅依赖温度(及 Ṫ)；残差输入中 raw6_norm 置零，需单独训练/部署，权重与 false 不通用
+  temp_only: false
 
 # ---- 训练（DeepXDE / PyTorch 共用字段）----
 training:
-  epochs: 50
-  batch_size: 8000
+  epochs: 30
+  # 须为整数；勿写 2048*10（YAML 会当成字符串）。大批次可写 20480
+  batch_size: 204800
   lr: 1.0e-3
   weight_decay: 1.0e-5
   grad_clip: 5.0               # 仅 train_pinn.py 使用
@@ -52,17 +57,21 @@ training:
   # true = 仅当验证集总 loss 下降时保存 dde_ckpt-*；false = 每次验证后都保存（文件较多）
   save_best_checkpoint_only: false
   physics_warmup: 30           # 物理损失从 0 线性升到满权重的「等效 epoch」数
+  # 验证指标 bad_any_rate：任一分量 |δ_pred-δ_true| 超过该阈值 (LSB) 的样本比例；与 eval_pinn --bad_x 一致
+  val_bad_threshold: 5.0
 
   # Adam 之后的 L-BFGS 精调迭代数（0 = 关闭）；仅 train_pinn_dde.py
   lbfgs_iters: 0
 
   # 设备: gpu_ids 多于 1 个且 CUDA 可用时启用 DataParallel（主卡为 gpu_ids[0]）
   # 单卡示例: [0] ；四卡示例: [0, 1, 2, 3]
-  gpu_ids: [0]
+  gpu_ids: [0,1,2,3]
   # 未配置 gpu_ids 时使用的单卡索引（或与 gpu_ids: [k] 等价）
-  cuda_device: 0
+  cuda_device: 0,1,2,3
   # true = 强制 CPU（调试用）；也可用 CLI: --cpu
   force_cpu: false
+  # DeepXDE 内置混合精度 (AMP)，与 Hugging Face accelerate 无关；也可用 CLI: --mixed
+  mixed_precision: false
 
 # ---- 物理损失权重 λ ----
 physics_loss:
@@ -83,4 +92,4 @@ physics_priors:
 
 # ---- 输出目录（checkpoint / TensorBoard / ONNX / split json）----
 output:
-  out_dir: "D:\\IMU_output"
+  out_dir: "outputs_pinn"

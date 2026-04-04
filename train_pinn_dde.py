@@ -12,6 +12,7 @@ PINN 训练入口 (DeepXDE 版)。
   python train_pinn_dde.py --config config/pinn_train.yaml --epochs 500
   python train_pinn_dde.py --config config/pinn_train.yaml --cpu   # 强制 CPU
   python train_pinn_dde.py --config config/pinn_train.yaml --gpus 0,1,2,3
+  python train_pinn_dde.py --config config/pinn_train.yaml --mixed  # DeepXDE 内置 AMP（非 HF accelerate）
   python train_pinn_dde.py --split_mode explicit --train_files 1.txt,2.txt,3.txt,4.txt --test_files 5.txt
 """
 from __future__ import annotations
@@ -41,6 +42,7 @@ from core.pinn_dde import (  # noqa: E402
     IMUNet, IMUPINNData, PhysicsWarmup, ProgressBar, TensorBoardCallback,
     export_onnx, save_dde_checkpoint, unwrap_parallel_net,
 )
+from core.pinn_metrics import make_delta_val_metrics  # noqa: E402
 from core.data_pipeline import (  # noqa: E402
     parse_data_file,
     stratified_split_by_temp_bin_round_int,
@@ -68,6 +70,29 @@ def _deep_get(d: dict, *keys, default=None):
             return default
         d = d.get(k, default)
     return d
+
+
+def _coerce_int(val, field: str) -> int:
+    """YAML 中若写 2048*10 会得到字符串；统一转为 int。"""
+    if isinstance(val, bool):
+        raise TypeError(f"{field}: 需要整数，不要用 YAML 布尔值")
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        return int(val)
+    if isinstance(val, str):
+        s = "".join(val.split())
+        if not s:
+            raise ValueError(f"{field}: 空字符串")
+        if "*" in s:
+            p = 1
+            for part in s.split("*"):
+                if not part:
+                    raise ValueError(f"{field}: 无效的乘法表达式 {val!r}")
+                p *= int(float(part))
+            return p
+        return int(float(s))
+    raise TypeError(f"{field}: 需要整数，得到 {type(val).__name__}")
 
 
 def compute_dTdt(T: np.ndarray) -> np.ndarray:
@@ -100,6 +125,8 @@ def build_cfg() -> dict:
                     help="单卡训练时的 GPU 索引（默认 0；多卡请用 --gpus）")
     ap.add_argument("--gpus", default=None,
                     help="多卡 DataParallel，逗号分隔 GPU 索引，如 0,1,2,3")
+    ap.add_argument("--mixed", action="store_true",
+                    help="启用 DeepXDE 混合精度 (torch.autocast AMP)。与 Hugging Face accelerate 库无关")
     ap.add_argument("--split_mode", choices=("random", "explicit"), default=None,
                     help="数据划分: random=随机留一文件作测试; explicit=用 train_files/test_files")
     ap.add_argument("--train_files", default=None,
@@ -145,17 +172,16 @@ def build_cfg() -> dict:
     c["use_dTdt"]          = g("model", "use_dTdt", default=True)
     c["use_hysteresis"]    = g("model", "use_hysteresis", default=False)
     c["hysteresis_hidden"] = g("model", "hysteresis_hidden", default=16)
+    c["temp_only"]         = bool(g("model", "temp_only", default=False))
 
     c["epochs"]         = args.epochs     if args.epochs     is not None else g("training", "epochs", default=300)
     c["batch_size"]     = args.batch_size if args.batch_size is not None else g("training", "batch_size", default=2048)
     c["lr"]             = args.lr         if args.lr         is not None else g("training", "lr", default=1e-3)
     c["weight_decay"]   = g("training", "weight_decay", default=1e-5)
     c["physics_warmup"] = g("training", "physics_warmup", default=30)
-    # 每隔多少个「数据 epoch」做一次验证、写 TensorBoard、触发 checkpoint 计数
-    c["log_interval"] = g("training", "log_interval", default=1)
-    c["save_best_checkpoint_only"] = bool(
-        g("training", "save_best_checkpoint_only", default=False))
+    c["log_interval"]   = g("training", "log_interval", default=10)
     c["lbfgs_iters"]    = args.lbfgs_iters if args.lbfgs_iters is not None else g("training", "lbfgs_iters", default=0)
+    c["val_bad_threshold"] = float(g("training", "val_bad_threshold", default=5.0))
 
     ploss = g("physics_loss") or {}
     c["lam"] = {
@@ -169,8 +195,9 @@ def build_cfg() -> dict:
         "L_grad_smooth":    ploss.get("L_grad_smooth",    1e-3),
     }
 
-    c["out_dir"] = args.out_dir or g("output", "out_dir", default="D:\\IMU_output")
+    c["out_dir"] = args.out_dir or g("output", "out_dir", default="outputs_pinn")
     c["force_cpu"] = bool(args.cpu) or bool(g("training", "force_cpu", default=False))
+    c["mixed_precision"] = bool(args.mixed) or bool(g("training", "mixed_precision", default=False))
 
     def _parse_gpu_ids(s: str | list | None) -> list[int] | None:
         if s is None:
@@ -190,7 +217,19 @@ def build_cfg() -> dict:
     elif yaml_gpus is not None:
         c["gpu_ids"] = _parse_gpu_ids(yaml_gpus)
     else:
-        c["gpu_ids"] = [int(cuda_def)]
+        c["gpu_ids"] = [_coerce_int(cuda_def, "training.cuda_device")]
+
+    c["N_used"] = _coerce_int(c["N_used"], "data.N_used")
+    c["seed"] = _coerce_int(c["seed"], "data.seed")
+    c["epochs"] = _coerce_int(c["epochs"], "training.epochs")
+    c["batch_size"] = _coerce_int(c["batch_size"], "training.batch_size")
+    c["physics_warmup"] = _coerce_int(c["physics_warmup"], "training.physics_warmup")
+    c["log_interval"] = _coerce_int(c["log_interval"], "training.log_interval")
+    c["lbfgs_iters"] = _coerce_int(c["lbfgs_iters"], "training.lbfgs_iters")
+    c["hidden_dim"] = _coerce_int(c["hidden_dim"], "model.hidden_dim")
+    c["n_hidden"] = _coerce_int(c["n_hidden"], "model.n_hidden")
+    c["thermal_dim"] = _coerce_int(c["thermal_dim"], "model.thermal_dim")
+    c["hysteresis_hidden"] = _coerce_int(c["hysteresis_hidden"], "model.hysteresis_hidden")
     return c
 
 
@@ -213,6 +252,13 @@ def load_data(cfg: dict):
 # -----------------------------------------------------------------------
 def main():
     cfg = build_cfg()
+    if cfg.get("mixed_precision"):
+        dde.config.set_default_float("mixed")
+        if cfg.get("force_cpu"):
+            print(
+                "[WARN] mixed_precision 已开启但 force_cpu=True；"
+                "AMP 在 CPU 上收益有限，建议 GPU 训练时使用。"
+            )
     out_dir = cfg["out_dir"]
     os.makedirs(out_dir, exist_ok=True)
 
@@ -311,7 +357,8 @@ def main():
     print(f"  {'TOTAL':12s} {n_params:>8,d}  ({kb:.1f} KB)")
     edge_ok = "YES" if n_params < 100_000 else "NO"
     print(f"  边缘设备适配: {edge_ok}  (<100K 参数阈值)")
-    print(f"  use_dTdt={cfg['use_dTdt']}  use_hysteresis={cfg['use_hysteresis']}")
+    print(f"  use_dTdt={cfg['use_dTdt']}  use_hysteresis={cfg['use_hysteresis']}  "
+          f"temp_only={cfg.get('temp_only', False)}")
 
     # ---- 外部可学习物理参数 (dde.Variable) ----
     log_k_E   = dde.Variable(math.log(60e-6))
@@ -341,16 +388,9 @@ def main():
     iters_per_epoch = max(1, N_train // bs)
     total_iters = cfg["epochs"] * iters_per_epoch
     warmup_iters = cfg["physics_warmup"] * iters_per_epoch
-    log_every_n_epochs = max(1, int(cfg["log_interval"]))
-    display_every = log_every_n_epochs * iters_per_epoch
+    display_every = max(1, cfg["log_interval"] * iters_per_epoch)
 
-    save_best_only = cfg["save_best_checkpoint_only"]
-    print(
-        f"[TRAIN] 验证集: n_test={len(X_test)}（DeepXDE data.test，对应 config 中 test 文件）\n"
-        f"        每 {log_every_n_epochs} 个 epoch 验证一次、写 TensorBoard、"
-        f"{'仅当验证 loss 变好时保存 dde_ckpt' if save_best_only else '每次验证后保存 dde_ckpt'} "
-        f"(ModelCheckpoint period={display_every} iters)"
-    )
+    val_metrics, val_metric_names = make_delta_val_metrics(cfg["val_bad_threshold"])
 
     model.compile(
         "adam",
@@ -359,22 +399,25 @@ def main():
         loss_weights=loss_weights,
         external_trainable_variables=ext_vars,
         decay=("cosine", total_iters, cfg["lr"] * 0.01),
+        metrics=val_metrics,
     )
 
     # ---- Callbacks ----
-    # 每次启动独立子目录，避免多次训练的 tfevents 混在同一 run 里、相同 epoch 互相覆盖，
-    # TensorBoard 看起来像「重启后不更新」。查看时指向 tb 根目录即可对比各次 run_*。
+    # 每次启动独立 run_*，查看时指向 tb 根目录即可对比多次训练（与参考仓库一致）
     tb_root = os.path.join(out_dir, "tb")
     tb_dir = os.path.join(tb_root, f"run_{time.strftime('%Y%m%d_%H%M%S')}")
     callbacks = [
         PhysicsWarmup(loss_weights, warmup_iters),
         ProgressBar(total_iters, desc="Adam"),
-        TensorBoardCallback(tb_dir, iters_per_epoch=iters_per_epoch),
+        TensorBoardCallback(
+            tb_dir,
+            iters_per_epoch=iters_per_epoch,
+            val_metric_names=val_metric_names,
+        ),
         dde.callbacks.ModelCheckpoint(
             os.path.join(out_dir, "dde_ckpt"),
-            save_better_only=save_best_only,
+            save_better_only=True,
             period=display_every,
-            monitor="test loss",
         ),
         dde.callbacks.VariableValue(
             ext_vars,
@@ -408,13 +451,18 @@ def main():
             loss="MSE",
             loss_weights=loss_weights,
             external_trainable_variables=ext_vars,
+            metrics=val_metrics,
         )
         lbfgs_display = max(1, lbfgs_iters // 10)
         losshistory, train_state = model.train(
             display_every=lbfgs_display,
             callbacks=[
                 ProgressBar(lbfgs_iters, desc="L-BFGS"),
-                TensorBoardCallback(tb_dir, iters_per_epoch=0),
+                TensorBoardCallback(
+                    tb_dir,
+                    iters_per_epoch=0,
+                    val_metric_names=val_metric_names,
+                ),
                 dde.callbacks.VariableValue(
                     ext_vars, period=lbfgs_display,
                     precision=8,
@@ -436,9 +484,11 @@ def main():
             "use_dTdt": cfg["use_dTdt"],
             "use_hysteresis": cfg["use_hysteresis"],
             "hysteresis_hidden": cfg["hysteresis_hidden"],
+            "temp_only": bool(cfg.get("temp_only", False)),
             "acc_scale": cfg["acc_scale"],
             "gyro_scale": cfg["gyro_scale"],
             "temp_scale": cfg["temp_scale"],
+            "val_bad_threshold": float(cfg["val_bad_threshold"]),
             "x_mean": x_mean.tolist(),
             "x_std":  x_std.tolist(),
             "y_mean": y_train.mean(axis=0).tolist(),
@@ -453,6 +503,7 @@ def main():
             "lbfgs_iters": lbfgs_iters,
             "gpu_ids": cfg["gpu_ids"],
             "split_mode": cfg.get("split_mode"),
+            "mixed_precision": bool(cfg.get("mixed_precision")),
         },
         "best_step": int(train_state.best_step),
         "best_loss": float(sum(train_state.best_loss_test)),

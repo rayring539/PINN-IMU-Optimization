@@ -28,8 +28,8 @@ outputs_stream_test/
 outputs_pinn/
 outputs_pinn_dde/
 
-# 数据与本地输出目录
-data/
+# 数据与本地输出目录（仅忽略仓库根目录的 data/，勿用 data/ 以免忽略 deepxde/deepxde/data/）
+/data/
 *.docx
 *.csv
 *.npy

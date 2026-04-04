@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 import os
 import sys
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -50,6 +50,10 @@ class IMUNet(dde.nn.NN):
     Input : (N, 7+) = [acc_raw(3), gyro_raw(3), T_raw(1), Tdot_raw(1, opt)]
     Output: (N, 6)  = delta6 (LSB)
 
+    temp_only
+      若 True，残差分支不读取加计/陀螺（raw6_norm 置零），输出仅由温度(及 Ṫ)经物理/热/残差决定；
+      数据格式仍为 7/8 列，需单独训练 checkpoint。
+
     Branches
       physics  — three-factor polynomial (acc g / gyro °/s → ×scale → LSB)
       thermal  — dde.nn.FNN (T_norm → features)
@@ -67,6 +71,7 @@ class IMUNet(dde.nn.NN):
         act      = cfg.get("act", "tanh")
         self.use_dTdt       = cfg.get("use_dTdt", True)
         self.use_hysteresis = cfg.get("use_hysteresis", False)
+        self.temp_only      = bool(cfg.get("temp_only", False))
 
         self.register_buffer("acc_scale",  torch.tensor(float(cfg.get("acc_scale", ACC_SCALE))))
         self.register_buffer("gyro_scale", torch.tensor(float(cfg.get("gyro_scale", GYRO_SCALE))))
@@ -112,39 +117,50 @@ class IMUNet(dde.nn.NN):
             out = out + d1 * Tdot_c + d2 * Tdot_c ** 2 + e1 * dT * Tdot_c
         return out
 
-    def forward(self, inputs):
-        raw6  = inputs[:, :6]
+    def forward_physics_hysteresis(self, inputs):
+        """物理分支 + 滞回分支（与 forward 前半段一致）。供损失里用 outputs 分解残差。"""
+        raw6 = inputs[:, :6]
         T_raw = inputs[:, 6:7]
         N = inputs.shape[0]
 
         T_c = T_raw / self.temp_scale
-        dT  = T_c - self.T_ref
+        dT = T_c - self.T_ref
 
         if self.use_dTdt:
             Tdot_c = inputs[:, 7:8] / self.temp_scale
         else:
             Tdot_c = torch.zeros_like(T_raw)
 
-        acc_g    = self._poly3("acc",  dT, Tdot_c)
+        acc_g = self._poly3("acc", dT, Tdot_c)
         gyro_dps = self._poly3("gyro", dT, Tdot_c)
-        physics  = torch.cat([acc_g * self.acc_scale,
-                              gyro_dps * self.gyro_scale], dim=1)
+        physics = torch.cat(
+            [acc_g * self.acc_scale, gyro_dps * self.gyro_scale], dim=1
+        )
 
         hysteresis = torch.zeros(N, 6, device=inputs.device, dtype=inputs.dtype)
         if self.use_hysteresis:
-            h0 = torch.zeros(N, self._hyst_h,
-                             device=inputs.device, dtype=inputs.dtype)
+            h0 = torch.zeros(
+                N, self._hyst_h, device=inputs.device, dtype=inputs.dtype
+            )
             h1 = self.hyst_gru(torch.cat([dT, Tdot_c], dim=1), h0)
             hysteresis = self.hyst_out(h1)
+        return physics, hysteresis
 
+    def forward(self, inputs):
+        physics, hysteresis = self.forward_physics_hysteresis(inputs)
+
+        raw6 = inputs[:, :6]
+        T_raw = inputs[:, 6:7]
         T_norm = (T_raw - self.x_mean[6:7]) / self.x_std[6:7]
         thermal = self.thermal_net(T_norm)
 
         raw6_norm = (raw6 - self.x_mean[:6]) / self.x_std[:6]
+        if self.temp_only:
+            raw6_norm = torch.zeros_like(raw6_norm)
         residual = self.residual_net(
             torch.cat([raw6_norm, thermal], dim=1)) * self.y_std
 
-        self._physics_part  = physics
+        self._physics_part = physics
         self._residual_part = residual
 
         return physics + hysteresis + residual
@@ -185,7 +201,7 @@ class IMUPINNData(dde.data.DataSet):
         return self.train_x[idx], self.train_y[idx]
 
     def losses(self, targets, outputs, loss_fn, inputs, model, aux=None):
-        net = model.net
+        net = unwrap_parallel_net(model.net)
         asc, gsc, tsc = net.acc_scale, net.gyro_scale, net.temp_scale
         dev = outputs.device
 
@@ -244,7 +260,9 @@ class IMUPINNData(dde.data.DataSet):
         L_gyro = torch.mean(torch.cat(gd2, dim=1))
 
         # ========= 7) 残差幅度 =========
-        res = net._residual_part
+        # DataParallel 时 forward 在子模块副本上执行，主 module 上无 _residual_part；用输出分解
+        physics, hysteresis = net.forward_physics_hysteresis(inputs)
+        res = outputs - physics - hysteresis
         L_res = ((res[:, :3] / asc) ** 2).mean() + ((res[:, 3:] / gsc) ** 2).mean()
 
         # ========= 8) 残差梯度光滑 =========
@@ -263,7 +281,7 @@ class IMUPINNData(dde.data.DataSet):
 
     def losses_test(self, targets, outputs, loss_fn, inputs, model, aux=None):
         """测试阶段只算数据损失 + 简单物理项 (跳过耗时的高阶梯度)。"""
-        net = model.net
+        net = unwrap_parallel_net(model.net)
         asc, gsc = net.acc_scale, net.gyro_scale
         dev = outputs.device
         zero = torch.tensor(0.0, device=dev)
@@ -279,7 +297,8 @@ class IMUPINNData(dde.data.DataSet):
         else:
             L_prior = zero
 
-        res = net._residual_part
+        physics, hysteresis = net.forward_physics_hysteresis(inputs)
+        res = outputs - physics - hysteresis
         L_res = ((res[:, :3] / asc) ** 2).mean() + ((res[:, 3:] / gsc) ** 2).mean()
 
         return [L_data, zero, L_prior, zero,
@@ -358,25 +377,32 @@ _LOSS_NAMES = [
 
 
 class TensorBoardCallback(dde.callbacks.Callback):
-    """参考 Monsterl-ite 的 TensorBoard 实现：
+    """参考 git 版 PINN-IMU-Optimization（Monsterl-ite 风格）的 TensorBoard：
 
-    - **train/***  每个优化步写一次（从 ``model._step_losses`` 读取）
-    - **val/***    仅在验证步（``_test()`` 被调用、``losshistory`` 新增条目）时写入
+    - **train/***  每个优化步写一次（从 ``model._step_losses`` 读取，由 ``Model._compile_pytorch`` 在
+      ``train_step`` 的 closure 里写入）
+    - **val/***    验证步：``losses_test`` 分项；若 ``model.compile(metrics=...)`` 则另有 6 轴
+      ``rmse_*`` / ``bad_*``、``rmse_total``、``bad_total``（与 ``training.val_bad_threshold`` 一致）。
 
-    横坐标 = ``train_state.step``（优化步）。
+    横坐标 = ``train_state.step``（优化步）。需配合 ``deepxde`` 中已打补丁的 ``_step_losses``。
     """
 
-    def __init__(self, log_dir: str, iters_per_epoch: int = 0):
+    def __init__(
+        self,
+        log_dir: str,
+        iters_per_epoch: int = 0,
+        val_metric_names: Sequence[str] | None = None,
+    ):
         super().__init__()
         self._log_dir = log_dir
         self._writer = None
         self._ipe = max(0, int(iters_per_epoch))
         self._lh_seen = 0
+        self._val_metric_names = tuple(val_metric_names) if val_metric_names else ()
 
-    # ---- train: 每步写 ----
     def _write_train(self, step: int) -> None:
         losses = getattr(self.model, "_step_losses", None)
-        if losses is None:
+        if losses is None or self._writer is None:
             return
         for i, val in enumerate(losses):
             name = _LOSS_NAMES[i] if i < len(_LOSS_NAMES) else f"term_{i}"
@@ -390,39 +416,48 @@ class TensorBoardCallback(dde.callbacks.Callback):
         if lr is not None:
             self._writer.add_scalar("train/lr", float(lr), step)
 
-    # ---- val: 验证时写 ----
     def _write_val(self, step: int) -> None:
         ts = self.model.train_state
-        if ts.loss_test is None:
+        if ts.loss_test is None or self._writer is None:
             return
         for i, val in enumerate(ts.loss_test):
             name = _LOSS_NAMES[i] if i < len(_LOSS_NAMES) else f"term_{i}"
             self._writer.add_scalar(f"val/{name}", float(val), step)
         self._writer.add_scalar("val/total", float(sum(ts.loss_test)), step)
 
+    def _write_val_metrics(self, step: int) -> None:
+        if not self._val_metric_names or self._writer is None:
+            return
+        ts = self.model.train_state
+        if not ts.metrics_test:
+            return
+        step = int(step)
+        for name, val in zip(self._val_metric_names, ts.metrics_test):
+            self._writer.add_scalar(f"val/{name}", float(val), step)
+
     def on_train_begin(self):
         from torch.utils.tensorboard import SummaryWriter
         os.makedirs(self._log_dir, exist_ok=True)
         self._writer = SummaryWriter(self._log_dir, flush_secs=5)
         self._lh_seen = 0
-        # 写入 step=0 的初始验证
         n = len(self.model.losshistory.steps)
         if n > 0:
             self._lh_seen = n
-            self._write_val(int(self.model.train_state.step))
+            st = int(self.model.train_state.step)
+            self._write_val(st)
+            self._write_val_metrics(st)
             self._writer.flush()
 
     def on_epoch_end(self):
         if self._writer is None:
             return
         step = int(self.model.train_state.step)
-        # train: 每步
         self._write_train(step)
-        # val: 仅当 losshistory 有新条目
         n = len(self.model.losshistory.steps)
         if n > self._lh_seen:
             self._lh_seen = n
             self._write_val(step)
+            self._write_val_metrics(step)
         self._writer.flush()
 
     def on_train_end(self):
@@ -522,7 +557,8 @@ def export_onnx(
 
     size_kb = os.path.getsize(out_path) / 1024
     print(f"[ONNX] 导出成功: {out_path}  ({size_kb:.1f} KB)")
-    print(f"       输入: imu_input  shape=(batch, {in_dim})")
+    print(f"       输入: imu_input  shape=(batch, {in_dim})"
+          f"{'  (temp_only: 残差不使用 raw6)' if getattr(net, 'temp_only', False) else ''}")
     print(f"       输出: delta6     shape=(batch, 6)")
     print(f"       opset={opset}")
 
