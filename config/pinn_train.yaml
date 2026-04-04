@@ -1,0 +1,65 @@
+# =============================================================================
+#  PINN 训练配置
+#  用法: python train_pinn.py --config config/pinn_train.yaml
+# =============================================================================
+
+# ---- 数据 ----
+data:
+  data_dir: "D:\\IMU_data"
+  # data_path: "data/1.txt"       # 单文件模式 (与 data_dir 二选一)
+  N_used: -1                       # -1 = 全部
+  test_ratio: 0.2                  # 仅单文件模式
+  seed: 0
+
+# ---- 传感器标度因子 ----
+#  数据 7 列: [acc×3, gyro×3, temp]
+#  col 0-2  加速度计  物理值(g)   = 寄存器值 / acc_scale
+#  col 3-5  陀螺仪    物理值(°/s) = 寄存器值 / gyro_scale
+#  col 6    温度      物理值(℃)   = 寄存器值 / temp_scale
+sensor:
+  acc_scale: 2048.0
+  gyro_scale: 16.0
+  temp_scale: 256.0
+
+# ---- 网络架构 (边缘设备友好: ~3.7K 参数 / 14 KB) ----
+model:
+  hidden_dim: 64              # 残差分支隐层宽度 (边缘: 32, 服务器: 64)
+  n_hidden: 4                 # 残差分支层数     (边缘: 3,  服务器: 4)
+  thermal_dim: 16             # 热特征分支输出维度
+  act: "tanh"
+  use_dTdt: true
+  use_hysteresis: false
+  hysteresis_hidden: 16
+
+# ---- 训练超参 ----
+#  21M 样本 × batch_size=4096 → ~5100 iter/epoch
+#  epochs=200 → 总计 ~102 万次迭代，约 1-2 小时
+training:
+  epochs: 200
+  batch_size: 4096
+  lr: 1.0e-3
+  weight_decay: 1.0e-5
+  grad_clip: 5.0
+  log_interval: 10
+  physics_warmup: 30
+
+# ---- 物理损失权重 (λ) ----
+physics_loss:
+  L_heat_smooth: 1.0e-2
+  L_physics_prior: 1.0e-1
+  L_stiffness_mono: 1.0e-2
+  L_acc_tdb: 1.0e-2
+  L_three_factor: 1.0e-2
+  L_gyro_smooth: 1.0e-2
+  L_residual_small: 1.0e-3
+  L_grad_smooth: 1.0e-3
+
+# ---- 可学习物理参数先验 ----
+physics_priors:
+  k_E_ppm: 60.0
+  alpha_ppm: 2.6
+  delta_alpha_ppm: 5.0
+
+# ---- 输出 (模型 + TensorBoard 日志) ----
+output:
+  out_dir: "D:\\IMU_output"

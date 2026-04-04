@@ -1,0 +1,26 @@
+# ===========================================================
+#  IMU Temperature Drift PINN 项目依赖
+#  pip install -r requirements.txt
+# ===========================================================
+
+# ---- 基础 ----
+numpy>=1.20
+matplotlib>=3.5
+
+# ---- PyTorch (PINN 核心) ----
+torch>=2.0
+
+# ---- 配置 ----
+pyyaml>=6.0
+
+# ---- 训练可视化 ----
+tensorboard>=2.14
+tqdm>=4.60
+
+# ---- ONNX 导出 / 量化 ----
+onnx>=1.14
+
+# ---- DeepXDE 运行时依赖 (本地源码 deepxde/ 已包含在项目中) ----
+scipy>=1.10
+scikit-learn>=1.0
+scikit-optimize>=0.10.2

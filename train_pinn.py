@@ -1,0 +1,412 @@
+"""
+PINN 训练入口 v2。
+
+优先从 YAML 读取配置，CLI 参数可覆盖。
+
+用法:
+  python train_pinn.py --config config/pinn_train.yaml
+  python train_pinn.py --config config/pinn_train.yaml --epochs 500
+  python train_pinn.py --data_dir D:\\IMU_data --epochs 300   # 无 YAML 也可
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.tensorboard import SummaryWriter
+
+from core.data_pipeline import parse_data_file, stratified_split_by_temp_bin_round_int
+from core.imu_data_io import DEFAULT_DATA_DIR, save_split_meta, split_train_test_by_random_file
+from core.pinn_model import PINN_IMU, PINNPhysicsLoss, save_pinn_checkpoint
+
+
+def print_model_summary(model: nn.Module) -> int:
+    """按分支统计参数量并打印摘要，返回总参数量。"""
+    groups: dict[str, int] = {}
+    for name, p in model.named_parameters():
+        prefix = name.split(".")[0]
+        if any(prefix.startswith(x) for x in ("acc_", "gyro_", "T_ref", "log_")):
+            key = "physics"
+        elif prefix == "thermal_net":
+            key = "thermal"
+        elif prefix == "residual_net":
+            key = "residual"
+        elif prefix.startswith("hyst"):
+            key = "hysteresis"
+        else:
+            key = prefix
+        groups[key] = groups.get(key, 0) + p.numel()
+    total = sum(groups.values())
+    kb = total * 4 / 1024
+    print("[MODEL] 参数统计 (float32):")
+    for k, v in groups.items():
+        print(f"  {k:12s} {v:>8,d}  ({100 * v / total:5.1f}%)")
+    print(f"  {'--------':12s} {'--------':>8s}")
+    print(f"  {'TOTAL':12s} {total:>8,d}  ({kb:.1f} KB)")
+    edge_ok = "YES" if total < 100_000 else "NO"
+    print(f"  边缘设备适配: {edge_ok}  (<100K 参数阈值)")
+    return total
+
+
+# -----------------------------------------------------------------------
+#  配置加载
+# -----------------------------------------------------------------------
+def _load_yaml(path: str) -> dict:
+    import yaml  # pyyaml
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def _deep_get(d: dict, *keys, default=None):
+    for k in keys:
+        if not isinstance(d, dict):
+            return default
+        d = d.get(k, default)
+    return d
+
+
+def build_cfg() -> dict:
+    """合并 YAML + CLI → 统一配置字典。"""
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default=None, help="YAML 配置文件路径")
+
+    # 以下 CLI 参数可覆盖 YAML 中同名字段
+    ap.add_argument("--data_dir", default=None)
+    ap.add_argument("--data_path", default=None)
+    ap.add_argument("--N_used", type=int, default=None)
+    ap.add_argument("--test_ratio", type=float, default=None)
+    ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--epochs", type=int, default=None)
+    ap.add_argument("--batch_size", type=int, default=None)
+    ap.add_argument("--lr", type=float, default=None)
+    ap.add_argument("--out_dir", default=None)
+    ap.add_argument("--hidden_dim", type=int, default=None)
+    ap.add_argument("--n_hidden", type=int, default=None)
+    ap.add_argument("--thermal_dim", type=int, default=None)
+    ap.add_argument("--act", default=None)
+    ap.add_argument("--use_dTdt", type=int, default=None)
+    ap.add_argument("--use_hysteresis", type=int, default=None)
+    ap.add_argument("--physics_warmup", type=int, default=None)
+    args = ap.parse_args()
+
+    # 基础配置 (若无 YAML 则用全默认)
+    cfg: dict = {}
+    if args.config and os.path.isfile(args.config):
+        cfg = _load_yaml(args.config)
+
+    def g(*keys, default=None):
+        return _deep_get(cfg, *keys, default=default)
+
+    # 合并: CLI 优先 > YAML > 默认值
+    c: dict = {}
+
+    # 数据
+    c["data_dir"]    = args.data_dir   or g("data", "data_dir")
+    c["data_path"]   = args.data_path  or g("data", "data_path")
+    c["N_used"]      = args.N_used     if args.N_used is not None else g("data", "N_used", default=-1)
+    c["test_ratio"]  = args.test_ratio if args.test_ratio is not None else g("data", "test_ratio", default=0.2)
+    c["seed"]        = args.seed       if args.seed is not None else g("data", "seed", default=0)
+
+    # 传感器标度因子
+    c["acc_scale"]  = g("sensor", "acc_scale",  default=2048.0)
+    c["gyro_scale"] = g("sensor", "gyro_scale", default=16.0)
+    c["temp_scale"] = g("sensor", "temp_scale", default=256.0)
+
+    # 网络
+    c["hidden_dim"]       = args.hidden_dim   if args.hidden_dim is not None else g("model", "hidden_dim", default=64)
+    c["n_hidden"]         = args.n_hidden     if args.n_hidden is not None else g("model", "n_hidden", default=4)
+    c["thermal_dim"]      = args.thermal_dim  if args.thermal_dim is not None else g("model", "thermal_dim", default=16)
+    c["act"]              = args.act          or g("model", "act", default="tanh")
+    c["use_dTdt"]         = bool(args.use_dTdt) if args.use_dTdt is not None else g("model", "use_dTdt", default=True)
+    c["use_hysteresis"]   = bool(args.use_hysteresis) if args.use_hysteresis is not None else g("model", "use_hysteresis", default=False)
+    c["hysteresis_hidden"] = g("model", "hysteresis_hidden", default=16)
+
+    # 训练
+    c["epochs"]          = args.epochs     if args.epochs is not None else g("training", "epochs", default=300)
+    c["batch_size"]      = args.batch_size if args.batch_size is not None else g("training", "batch_size", default=2048)
+    c["lr"]              = args.lr         if args.lr is not None else g("training", "lr", default=1e-3)
+    c["weight_decay"]    = g("training", "weight_decay", default=1e-5)
+    c["grad_clip"]       = g("training", "grad_clip", default=5.0)
+    c["log_interval"]    = g("training", "log_interval", default=10)
+    c["physics_warmup"]  = args.physics_warmup if args.physics_warmup is not None else g("training", "physics_warmup", default=30)
+
+    # 物理损失权重
+    ploss = g("physics_loss") or {}
+    c["lam"] = {
+        "L_heat_smooth":    ploss.get("L_heat_smooth",    1e-2),
+        "L_physics_prior":  ploss.get("L_physics_prior",  1e-1),
+        "L_stiffness_mono": ploss.get("L_stiffness_mono", 1e-2),
+        "L_acc_tdb":        ploss.get("L_acc_tdb",        1e-2),
+        "L_three_factor":   ploss.get("L_three_factor",   1e-2),
+        "L_gyro_smooth":    ploss.get("L_gyro_smooth",    1e-2),
+        "L_residual_small": ploss.get("L_residual_small", 1e-3),
+        "L_grad_smooth":    ploss.get("L_grad_smooth",    1e-3),
+    }
+
+    # 输出
+    c["out_dir"] = args.out_dir or g("output", "out_dir", default="outputs_pinn")
+
+    return c
+
+
+# -----------------------------------------------------------------------
+#  数据加载 + dT/dt 计算
+# -----------------------------------------------------------------------
+def compute_dTdt(T: np.ndarray) -> np.ndarray:
+    """有限差分近似 dT/dt (假设等间隔采样)。返回 (N,1)。"""
+    dT = np.zeros_like(T)
+    dT[1:-1] = (T[2:] - T[:-2]) / 2.0  # 中心差分
+    dT[0]    = T[1] - T[0] if len(T) > 1 else 0.0
+    dT[-1]   = T[-1] - T[-2] if len(T) > 1 else 0.0
+    return dT.reshape(-1, 1)
+
+
+def load_data(cfg: dict):
+    """返回 X_train, y_train, Tdot_train, X_test, y_test, Tdot_test, split_meta, raw_min, raw_max"""
+    multi = cfg["data_path"] is None
+    if not multi:
+        multi = False
+    elif cfg["data_dir"] is None:
+        cfg["data_dir"] = DEFAULT_DATA_DIR
+        multi = True
+
+    if multi:
+        train_paths, test_path, split_meta = split_train_test_by_random_file(
+            cfg["data_dir"], cfg["seed"]
+        )
+        os.makedirs(cfg["out_dir"], exist_ok=True)
+        split_json = os.path.join(cfg["out_dir"], "train_test_split.json")
+        save_split_meta(split_meta, split_json)
+        print(f"[SPLIT] test={split_meta['test_basename']}  "
+              f"train={split_meta['train_basenames']}")
+
+        xs, ys = [], []
+        total = 0
+        n_limit = cfg["N_used"]
+        for fp in train_paths:
+            remain = None if n_limit < 0 else max(0, n_limit - total)
+            if remain is not None and remain <= 0:
+                break
+            xf, yf = parse_data_file(fp, n_lines=remain)
+            xs.append(xf); ys.append(yf); total += len(xf)
+        X_train = np.concatenate(xs)
+        y_train = np.concatenate(ys)
+
+        test_n = None if cfg["N_used"] < 0 else cfg["N_used"]
+        X_test, y_test = parse_data_file(test_path, n_lines=test_n)
+    else:
+        n_lines = None if cfg["N_used"] < 0 else cfg["N_used"]
+        X_raw, y = parse_data_file(cfg["data_path"], n_lines=n_lines)
+        X_train, y_train, X_test, y_test = stratified_split_by_temp_bin_round_int(
+            X_raw, y, test_ratio=cfg["test_ratio"], seed=cfg["seed"]
+        )
+        split_meta = None
+
+    # dT/dt (训练集和测试集分别计算)
+    Tdot_train = compute_dTdt(X_train[:, 6])
+    Tdot_test  = compute_dTdt(X_test[:, 6])
+
+    return X_train, y_train, Tdot_train, X_test, y_test, Tdot_test, split_meta
+
+
+# -----------------------------------------------------------------------
+#  训练主函数
+# -----------------------------------------------------------------------
+def main():
+    cfg = build_cfg()
+    os.makedirs(cfg["out_dir"], exist_ok=True)
+
+    # 保存本次使用的配置
+    with open(os.path.join(cfg["out_dir"], "train_config.json"), "w", encoding="utf-8") as f:
+        json.dump({k: v for k, v in cfg.items()}, f, ensure_ascii=False, indent=2, default=str)
+
+    # ---- 数据 ----
+    print("[DATA] 加载数据 ...")
+    (X_train, y_train, Tdot_train,
+     X_test, y_test, Tdot_test,
+     split_meta) = load_data(cfg)
+
+    T_c_range = X_train[:, 6] / cfg["temp_scale"]
+    print(f"[DATA] train={len(X_train)}  test={len(X_test)}  "
+          f"T_℃=[{T_c_range.min():.1f}, {T_c_range.max():.1f}]")
+
+    x_mean = X_train.mean(axis=0)
+    x_std  = X_train.std(axis=0) + 1e-8
+    y_mean = y_train.mean(axis=0)
+    y_std  = y_train.std(axis=0) + 1e-8
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[DEVICE] {device}")
+
+    # ---- 模型 ----
+    model = PINN_IMU(
+        hidden_dim=cfg["hidden_dim"],
+        n_hidden=cfg["n_hidden"],
+        thermal_dim=cfg["thermal_dim"],
+        act=cfg["act"],
+        use_dTdt=cfg["use_dTdt"],
+        use_hysteresis=cfg["use_hysteresis"],
+        hysteresis_hidden=cfg["hysteresis_hidden"],
+        acc_scale=cfg["acc_scale"],
+        gyro_scale=cfg["gyro_scale"],
+        temp_scale=cfg["temp_scale"],
+        x_mean=x_mean, x_std=x_std,
+        y_mean=y_mean, y_std=y_std,
+    ).to(device)
+    n_params = print_model_summary(model)
+    print(f"  use_dTdt={cfg['use_dTdt']}  use_hysteresis={cfg['use_hysteresis']}")
+
+    # ---- DataLoader (包含 Tdot) ----
+    Xt = torch.from_numpy(X_train.astype(np.float32))
+    yt = torch.from_numpy(y_train.astype(np.float32))
+    Tt = torch.from_numpy(Tdot_train.astype(np.float32))
+    loader = DataLoader(
+        TensorDataset(Xt, yt, Tt),
+        batch_size=cfg["batch_size"], shuffle=True,
+        drop_last=False, pin_memory=(device == "cuda"),
+    )
+
+    # ---- 优化器 ----
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"],
+                                  weight_decay=cfg["weight_decay"])
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=cfg["epochs"], eta_min=cfg["lr"] * 0.01
+    )
+
+    lam = cfg["lam"]
+    best_test_rmse = float("inf")
+    t0 = time.time()
+
+    tb_dir = os.path.join(cfg["out_dir"], "tb")
+    writer = SummaryWriter(log_dir=tb_dir)
+    print(f"[TB] TensorBoard log → {tb_dir}")
+
+    for epoch in range(1, cfg["epochs"] + 1):
+        model.train()
+        ep_data = ep_phys = 0.0
+        ep_terms: dict[str, float] = {k: 0.0 for k in lam}
+        nb = 0
+        warmup = min(1.0, epoch / max(1, cfg["physics_warmup"]))
+
+        for xb, yb, tb in loader:
+            xb, yb, tb = xb.to(device), yb.to(device), tb.to(device)
+
+            T_col = xb[:, 6:7].detach().requires_grad_(True)
+            xb_grad = torch.cat([xb[:, :6], T_col], dim=1)
+
+            delta_pred, phys_part, hyst_part, res_part, _ = model(
+                xb_grad, Tdot=tb, return_parts=True
+            )
+
+            loss_data = F.mse_loss(delta_pred, yb)
+
+            ploss = PINNPhysicsLoss.compute(
+                model, xb_grad, delta_pred, T_col,
+                phys_part, res_part, Tdot=tb,
+            )
+            loss_phys = sum(lam[k] * warmup * v for k, v in ploss.items())
+
+            loss = loss_data + loss_phys
+
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg["grad_clip"])
+            optimizer.step()
+
+            ep_data += loss_data.item()
+            ep_phys += (loss_phys.item() if isinstance(loss_phys, torch.Tensor)
+                        else loss_phys)
+            for k, v in ploss.items():
+                ep_terms[k] += (v.item() if isinstance(v, torch.Tensor) else v)
+            nb += 1
+
+        scheduler.step()
+        avg_d = ep_data / max(nb, 1)
+        avg_p = ep_phys / max(nb, 1)
+
+        # ---- TensorBoard: 每 epoch 写 loss ----
+        writer.add_scalar("loss/data", avg_d, epoch)
+        writer.add_scalar("loss/physics_total", avg_p, epoch)
+        writer.add_scalar("loss/total", avg_d + avg_p, epoch)
+        for k, v in ep_terms.items():
+            writer.add_scalar(f"physics/{k}", v / max(nb, 1), epoch)
+
+        # ---- 验证 ----
+        do_log = (epoch % cfg["log_interval"] == 0
+                  or epoch == 1 or epoch == cfg["epochs"])
+        if do_log:
+            model.eval()
+            delta_test = model.predict_delta6(
+                X_test, Tdot_np=Tdot_test if cfg["use_dTdt"] else None
+            )
+            corr_true = X_test[:, :6] + y_test
+            corr_pred = X_test[:, :6] + delta_test
+            test_rmse = float(np.sqrt(np.mean((corr_pred - corr_true) ** 2)))
+
+            lr_now = scheduler.get_last_lr()[0]
+            print(f"[E{epoch:04d}] data={avg_d:.4f}  phys={avg_p:.6f}  "
+                  f"test_rmse={test_rmse:.4f}  lr={lr_now:.2e}  "
+                  f"elapsed={time.time()-t0:.1f}s")
+
+            writer.add_scalar("metrics/test_rmse", test_rmse, epoch)
+            writer.add_scalar("lr", lr_now, epoch)
+
+            if test_rmse < best_test_rmse:
+                best_test_rmse = test_rmse
+                _save(model, cfg, x_mean, x_std, y_mean, y_std,
+                      split_meta, epoch, test_rmse, "best")
+
+    _save(model, cfg, x_mean, x_std, y_mean, y_std,
+          split_meta, cfg["epochs"], best_test_rmse, "final")
+    writer.close()
+    print(f"[DONE] best_test_rmse={best_test_rmse:.4f}  "
+          f"elapsed={time.time()-t0:.1f}s")
+    print(f"[TB] tensorboard --logdir {tb_dir}")
+
+
+def _save(model, cfg, x_mean, x_std, y_mean, y_std,
+          split_meta, epoch, test_rmse, tag):
+    meta = {
+        "hyperparams": {
+            "hidden_dim": cfg["hidden_dim"],
+            "n_hidden": cfg["n_hidden"],
+            "thermal_dim": cfg["thermal_dim"],
+            "act": cfg["act"],
+            "use_dTdt": cfg["use_dTdt"],
+            "use_hysteresis": cfg["use_hysteresis"],
+            "hysteresis_hidden": cfg["hysteresis_hidden"],
+            "acc_scale": cfg["acc_scale"],
+            "gyro_scale": cfg["gyro_scale"],
+            "temp_scale": cfg["temp_scale"],
+            "x_mean": x_mean.tolist(),
+            "x_std": x_std.tolist(),
+            "y_mean": y_mean.tolist(),
+            "y_std": y_std.tolist(),
+        },
+        "training": {
+            "epochs": cfg["epochs"],
+            "lr": cfg["lr"],
+            "batch_size": cfg["batch_size"],
+            "lam": cfg["lam"],
+            "physics_warmup": cfg["physics_warmup"],
+            "seed": cfg["seed"],
+        },
+        "best_epoch": epoch,
+        "test_rmse": test_rmse,
+        "split_meta": split_meta,
+    }
+    path = os.path.join(cfg["out_dir"], f"pinn_model_{tag}.pt")
+    save_pinn_checkpoint(model, meta, path)
+    print(f"  -> saved {path}")
+
+
+if __name__ == "__main__":
+    main()

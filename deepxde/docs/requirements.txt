@@ -1,0 +1,24 @@
+matplotlib
+numpy
+scikit-learn
+scikit-optimize>=0.10.2
+scipy
+
+# TensorFlow 1.x
+tensorflow-cpu==2.18.0
+# TensorFlow 2.x
+tf-keras==2.18.0
+tensorflow-probability==0.25.0
+# PyTorch
+torch
+# PaddlePaddle
+# https://paddle-wheel.bj.bcebos.com/develop/linux/linux-cpu-mkl-avx/paddlepaddle-0.0.0-cp38-cp38-linux_x86_64.whl
+paddlepaddle
+# JAX
+jax
+flax
+optax
+
+sphinx-copybutton
+sphinx-math-dollar
+sphinx-rtd-theme

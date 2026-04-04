@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 训练产物 / 大文件（勿提交）
+*.pt
+*.onnx
+outputs_pinn/
+outputs_pinn_dde/
+tb/
+*.log
+
+# 本地数据与文档（体积大）
+*.docx
+data/
