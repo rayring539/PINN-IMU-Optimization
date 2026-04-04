@@ -1,0 +1,52 @@
+{
+  "data_dir": "/path/to/IMU_data",
+  "data_path": null,
+  "N_used": -1,
+  "test_ratio": 0.2,
+  "seed": 0,
+  "split_mode": "explicit",
+  "train_files": [
+    "1.txt",
+    "2.txt",
+    "3.txt",
+    "4.txt"
+  ],
+  "test_files": [
+    "5.txt"
+  ],
+  "acc_scale": 2048.0,
+  "gyro_scale": 16.0,
+  "temp_scale": 256.0,
+  "hidden_dim": 32,
+  "n_hidden": 3,
+  "thermal_dim": 16,
+  "act": "tanh",
+  "use_dTdt": true,
+  "use_hysteresis": true,
+  "hysteresis_hidden": 16,
+  "temp_only": false,
+  "epochs": 100,
+  "batch_size": 10240,
+  "lr": 0.0001,
+  "weight_decay": 1e-05,
+  "physics_warmup": 30,
+  "log_interval": 1,
+  "lbfgs_iters": 500,
+  "val_bad_threshold": 5.0,
+  "lam": {
+    "L_heat_smooth": 0.01,
+    "L_physics_prior": 0.1,
+    "L_stiffness_mono": 0.01,
+    "L_acc_tdb": 0.01,
+    "L_three_factor": 0.01,
+    "L_gyro_smooth": 0.01,
+    "L_residual_small": 0.001,
+    "L_grad_smooth": 0.001
+  },
+  "out_dir": "outputs_pinn",
+  "force_cpu": false,
+  "mixed_precision": false,
+  "gpu_ids": [
+    1
+  ]
+}

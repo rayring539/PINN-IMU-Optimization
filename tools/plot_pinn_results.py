@@ -21,7 +21,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from core.pinn_model import ACC_SCALE, GYRO_SCALE, TEMP_SCALE, load_pinn_checkpoint
+from core.pinn_dde import load_eval_checkpoint
+from core.pinn_model import ACC_SCALE, GYRO_SCALE, TEMP_SCALE, PINN_IMU
 
 
 def load_data_7col(path: str, n_lines: int | None = None):
@@ -61,6 +62,11 @@ def main():
                     default=os.path.join(_REPO, "outputs_pinn", "pinn_corrected_6d.png"))
     ap.add_argument("--show_components", type=int, default=1,
                     help="1: 同时画 raw / corrected / physics-only 三条线")
+    ap.add_argument(
+        "--train_config",
+        default=None,
+        help="与 dde_ckpt-*.pt 配套；默认 <model_path 所在目录>/train_config.json",
+    )
     args = ap.parse_args()
 
     # 确定绘图数据
@@ -70,7 +76,13 @@ def main():
         plot_path = args.data_path
     else:
         with open(args.split_meta, "r", encoding="utf-8") as f:
-            plot_path = json.load(f)["test_file"]
+            meta = json.load(f)
+        if "test_file" in meta:
+            plot_path = meta["test_file"]
+        elif meta.get("test_files"):
+            plot_path = meta["test_files"][0]
+        else:
+            raise KeyError("train_test_split.json 中缺少 test_file 或 test_files")
 
     n_lines = None if args.N_used < 0 else args.N_used
     X = load_data_7col(plot_path, n_lines=n_lines)
@@ -80,7 +92,9 @@ def main():
 
     # 加载 PINN
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model, meta = load_pinn_checkpoint(args.model_path, device=device)
+    model, meta = load_eval_checkpoint(
+        args.model_path, args.train_config, device
+    )
     model.eval()
 
     # dT/dt
@@ -103,7 +117,14 @@ def main():
         with torch.no_grad():
             xt = torch.from_numpy(X.astype(np.float32)).to(device)
             td = torch.from_numpy(Tdot_np.astype(np.float32)).to(device) if Tdot_np is not None else None
-            _, phys_t, _hyst_t, res_t, _ = model(xt, Tdot=td, return_parts=True)
+            if isinstance(model, PINN_IMU):
+                _, phys_t, _hyst_t, res_t, _ = model(xt, Tdot=td, return_parts=True)
+            else:
+                if use_dTdt and td is not None:
+                    x_in = torch.cat([xt, td], dim=1)
+                else:
+                    x_in = xt
+                _, phys_t, _hyst_t, res_t, _ = model(x_in, return_parts=True)
             phys_np = phys_t.cpu().numpy().astype(np.float64)
             res_np = res_t.cpu().numpy().astype(np.float64)
 

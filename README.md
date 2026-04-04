@@ -2,6 +2,8 @@
 
 基于物理信息神经网络（PINN）的 IMU 六轴温度漂移校正项目：在 **PyTorch** 与 **DeepXDE** 两套训练流程下，联合数据拟合与物理约束（热传导光滑、材料先验、三因子误差模型等），细节见 `config/pinn_train.yaml` 与 `core/` 中损失实现。
 
+**模型结构、输入输出与 checkpoint 类型**见 [`docs/model_intro.md`](docs/model_intro.md)。
+
 ## 功能概览
 
 - **传感器标度**：加速度 `÷2048`（g）、角速度 `÷16`（°/s）、温度 `÷256`（℃），物理损失在物理单位下计算。
@@ -29,6 +31,8 @@ IMU/
 ├── requirements.txt
 ├── config/
 │   └── pinn_train.yaml       # 训练与数据划分主配置
+├── docs/
+│   └── model_intro.md        # 模型结构、输入输出与 checkpoint 说明
 ├── core/                     # 模型、数据 IO、DeepXDE 封装
 ├── deepxde/                  # 随仓库提供的 DeepXDE 源码（仅包含包本体，不含上游 docs/examples）
 ├── tools/                    # 画图、ONNX 导出脚本等
@@ -72,8 +76,12 @@ python train_pinn_dde.py --split_mode explicit --train_files "1.txt,2.txt,3.txt,
 
 ```bash
 python eval_pinn.py --model_path <out_dir>/pinn_model_best.pt --split_meta <out_dir>/train_test_split.json
+# 仅有 DeepXDE 中间权重 dde_ckpt-*.pt 时：需同目录 train_config.json，或 --train_config 指定
+python eval_pinn.py --model_path <out_dir>/dde_ckpt-3150.pt
 python tools/plot_pinn_results.py --model_path <out_dir>/pinn_model_best.pt --split_meta <out_dir>/train_test_split.json --out_png <out_dir>/pinn_corrected_6d.png
 ```
+
+仓库中 `outputs_pinn/` 下可提交 **JSON**（`train_config.json`、`train_test_split.json`、评测摘要等）；**`.pt` / TensorBoard** 仍被忽略，需在本地训练生成。
 
 ### 4. 仅导出 ONNX（已有 checkpoint）
 

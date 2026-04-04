@@ -10,6 +10,7 @@ DeepXDE-based PINN for IMU 6-axis temperature drift correction (v3-dde).
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import sys
@@ -146,7 +147,7 @@ class IMUNet(dde.nn.NN):
             hysteresis = self.hyst_out(h1)
         return physics, hysteresis
 
-    def forward(self, inputs):
+    def forward(self, inputs, *, return_parts: bool = False):
         physics, hysteresis = self.forward_physics_hysteresis(inputs)
 
         raw6 = inputs[:, :6]
@@ -163,18 +164,33 @@ class IMUNet(dde.nn.NN):
         self._physics_part = physics
         self._residual_part = residual
 
-        return physics + hysteresis + residual
+        delta = physics + hysteresis + residual
+        if return_parts:
+            return delta, physics, hysteresis, residual, None
+        return delta
 
     @torch.no_grad()
-    def predict_delta6(self, X_np: np.ndarray,
-                       chunk: int = 50000) -> np.ndarray:
-        """NumPy 推理 (兼容 eval/plot 脚本)。"""
+    def predict_delta6(
+        self,
+        X_np: np.ndarray,
+        Tdot_np: np.ndarray | None = None,
+        chunk: int = 50000,
+    ) -> np.ndarray:
+        """NumPy 推理。``use_dTdt`` 时需 7 列 X + ``Tdot_np`` 拼成 8 列与训练一致。"""
         dev = next(self.parameters()).device
-        N = X_np.shape[0]
+        if self.use_dTdt:
+            if Tdot_np is None:
+                Tdot_np = np.zeros((X_np.shape[0], 1), dtype=np.float32)
+            X_full = np.hstack(
+                [X_np.astype(np.float32), Tdot_np.astype(np.float32)]
+            )
+        else:
+            X_full = X_np
+        N = X_full.shape[0]
         out = np.zeros((N, 6), dtype=np.float64)
         for s in range(0, N, chunk):
             e = min(s + chunk, N)
-            xt = torch.from_numpy(X_np[s:e].astype(np.float32)).to(dev)
+            xt = torch.from_numpy(X_full[s:e].astype(np.float32)).to(dev)
             out[s:e] = self.forward(xt).cpu().numpy().astype(np.float64)
         return out
 
@@ -504,6 +520,76 @@ def load_dde_checkpoint(
     for val in ckpt.get("ext_vars", []):
         ext_vars.append(torch.nn.Parameter(torch.tensor(val)))
     return net, ext_vars, meta
+
+
+def load_imunet_from_dde_model_save(
+    path: str,
+    cfg: dict,
+    device: str = "cpu",
+) -> tuple[IMUNet, dict[str, Any]]:
+    """从 DeepXDE ``Model.save()`` 的 ``dde_ckpt-*.pt`` 恢复 ``IMUNet``。
+
+    文件通常仅含 ``model_state_dict`` / ``optimizer_state_dict``，无 ``meta``。
+    ``x_mean`` / ``x_std`` / ``y_std`` 以权重里的 buffer 为准（与训练一致）。
+    返回 ``(net, cfg_used)``：若 ``train_config`` 与权重中是否含迟滞分支不一致，``cfg_used`` 以权重为准。
+    """
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    sd = ckpt.get("model_state_dict")
+    if sd is None:
+        raise ValueError(
+            f"期望 DeepXDE Model.save 格式（含 model_state_dict）: {path}"
+        )
+    new_sd = {}
+    for k, v in sd.items():
+        nk = k[7:] if k.startswith("module.") else k
+        new_sd[nk] = v
+    # 迟滞分支可选：仅以权重为准，避免 train_config 与保存时不一致（如后来改过 YAML）
+    has_hyst = any(k.startswith("hyst_gru") or k.startswith("hyst_out") for k in new_sd)
+    cfg_m = dict(cfg)
+    want_hyst = bool(cfg_m.get("use_hysteresis", False))
+    if want_hyst != has_hyst:
+        cfg_m["use_hysteresis"] = has_hyst
+        print(
+            f"[WARN] train_config use_hysteresis={want_hyst} 与 checkpoint 不一致，"
+            f"已改为 use_hysteresis={has_hyst}（以权重为准）。"
+        )
+    x_mean = np.zeros(7, dtype=np.float32)
+    x_std = np.ones(7, dtype=np.float32)
+    y_std = np.ones(6, dtype=np.float32)
+    net = IMUNet(cfg_m, x_mean, x_std, y_std)
+    net.load_state_dict(new_sd, strict=True)
+    net.to(device)
+    net.eval()
+    return net, cfg_m
+
+
+def load_eval_checkpoint(
+    model_path: str,
+    train_config_path: str | None,
+    device: str = "cpu",
+) -> tuple[Any, dict[str, Any]]:
+    """从 ``pinn_model_best.pt`` 或 DeepXDE ``dde_ckpt-*.pt`` 加载模型与 meta。"""
+    from core.pinn_model import load_pinn_checkpoint
+
+    blob = torch.load(model_path, map_location=device, weights_only=False)
+    if isinstance(blob, dict) and "meta" in blob and "model_state" in blob:
+        return load_pinn_checkpoint(model_path, device)
+    if isinstance(blob, dict) and "model_state_dict" in blob:
+        tc = train_config_path
+        if not tc:
+            d = os.path.dirname(os.path.abspath(model_path))
+            tc = os.path.join(d if d else ".", "train_config.json")
+        if not os.path.isfile(tc):
+            raise FileNotFoundError(
+                f"DeepXDE 中间 checkpoint 需 train_config.json（或指定路径），未找到: {tc}"
+            )
+        with open(tc, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        model, cfg_used = load_imunet_from_dde_model_save(model_path, cfg, device)
+        return model, {"hyperparams": cfg_used}
+    raise ValueError(
+        f"无法识别 checkpoint: {model_path}（需 pinn_model_best 或 dde_ckpt 的 model_state_dict）"
+    )
 
 
 # ---------------------------------------------------------------------------
