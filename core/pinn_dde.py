@@ -358,40 +358,75 @@ _LOSS_NAMES = [
 
 
 class TensorBoardCallback(dde.callbacks.Callback):
-    """将 DeepXDE 训练/测试 loss 写入 TensorBoard。"""
+    """将 DeepXDE 训练/测试 loss 写入 TensorBoard。
 
-    def __init__(self, log_dir: str):
+    DeepXDE 的 ``_train_sgd`` 仅在 ``step % display_every == 0``（或最后一轮）
+    时调用 ``_test()`` 刷新 ``loss_train`` / ``loss_test``；而 ``on_epoch_end``
+    每步都会触发。若在未刷新时仍写标量，会用**上一轮**的 loss 配上**新的** step，
+    TensorBoard 上会出现长水平线段（看似直线）。因此只在
+    ``losshistory.steps[-1] == train_state.step`` 时写入，与控制台打印对齐。
+
+    ``loss_test`` 来自 ``IMUPINNData`` 的 ``test_x/test_y``（配置里的 test_files /
+    留出集），即**验证集**；除 ``test/*`` 外同时写入 ``val/*`` 便于在 TensorBoard
+    里按「验证」理解。横坐标默认使用 **epoch**（``step // iters_per_epoch``）。
+    """
+
+    def __init__(self, log_dir: str, iters_per_epoch: int = 0):
         super().__init__()
         self._log_dir = log_dir
         self._writer = None
-        self._last_step = -1
+        self._ipe = max(0, int(iters_per_epoch))
+
+    def _tb_step(self, train_step: int) -> int:
+        if self._ipe > 0:
+            return int(train_step) // self._ipe
+        return int(train_step)
+
+    def _write_losses(self, ts) -> None:
+        train_step = int(ts.step)
+        x = self._tb_step(train_step)
+        for i, val in enumerate(ts.loss_train):
+            name = _LOSS_NAMES[i] if i < len(_LOSS_NAMES) else f"term_{i}"
+            self._writer.add_scalar(f"train/{name}", float(val), x)
+        self._writer.add_scalar("train/total", float(sum(ts.loss_train)), x)
+
+        if ts.loss_test is not None:
+            tot = float(sum(ts.loss_test))
+            for i, val in enumerate(ts.loss_test):
+                name = _LOSS_NAMES[i] if i < len(_LOSS_NAMES) else f"term_{i}"
+                v = float(val)
+                self._writer.add_scalar(f"test/{name}", v, x)
+                self._writer.add_scalar(f"val/{name}", v, x)
+            self._writer.add_scalar("test/total", tot, x)
+            self._writer.add_scalar("val/total", tot, x)
 
     def on_train_begin(self):
         from torch.utils.tensorboard import SummaryWriter
         os.makedirs(self._log_dir, exist_ok=True)
-        self._writer = SummaryWriter(self._log_dir)
+        # flush_secs 默认较大，长时间训练或重启后浏览器里会迟迟看不到新点
+        self._writer = SummaryWriter(self._log_dir, flush_secs=5)
+        # 训练循环前会做一次 _test(step=0)，写入初始 train/test 曲线起点
+        ts = self.model.train_state
+        lh = self.model.losshistory
+        if ts.loss_train is not None and lh.steps and lh.steps[-1] == ts.step:
+            self._write_losses(ts)
+            self._writer.flush()
 
     def on_epoch_end(self):
         ts = self.model.train_state
-        step = ts.step
-        if step == self._last_step or ts.loss_train is None:
+        if ts.loss_train is None or self._writer is None:
             return
-        self._last_step = step
-
-        for i, val in enumerate(ts.loss_train):
-            name = _LOSS_NAMES[i] if i < len(_LOSS_NAMES) else f"term_{i}"
-            self._writer.add_scalar(f"train/{name}", float(val), step)
-        self._writer.add_scalar("train/total", float(sum(ts.loss_train)), step)
-
-        if ts.loss_test is not None:
-            for i, val in enumerate(ts.loss_test):
-                name = _LOSS_NAMES[i] if i < len(_LOSS_NAMES) else f"term_{i}"
-                self._writer.add_scalar(f"test/{name}", float(val), step)
-            self._writer.add_scalar("test/total", float(sum(ts.loss_test)), step)
+        lh = self.model.losshistory
+        if not lh.steps or lh.steps[-1] != ts.step:
+            return
+        self._write_losses(ts)
+        self._writer.flush()
 
     def on_train_end(self):
         if self._writer:
+            self._writer.flush()
             self._writer.close()
+            self._writer = None
 
 
 # ---------------------------------------------------------------------------

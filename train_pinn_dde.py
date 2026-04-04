@@ -151,7 +151,10 @@ def build_cfg() -> dict:
     c["lr"]             = args.lr         if args.lr         is not None else g("training", "lr", default=1e-3)
     c["weight_decay"]   = g("training", "weight_decay", default=1e-5)
     c["physics_warmup"] = g("training", "physics_warmup", default=30)
-    c["log_interval"]   = g("training", "log_interval", default=10)
+    # 每隔多少个「数据 epoch」做一次验证、写 TensorBoard、触发 checkpoint 计数
+    c["log_interval"] = g("training", "log_interval", default=1)
+    c["save_best_checkpoint_only"] = bool(
+        g("training", "save_best_checkpoint_only", default=False))
     c["lbfgs_iters"]    = args.lbfgs_iters if args.lbfgs_iters is not None else g("training", "lbfgs_iters", default=0)
 
     ploss = g("physics_loss") or {}
@@ -338,7 +341,16 @@ def main():
     iters_per_epoch = max(1, N_train // bs)
     total_iters = cfg["epochs"] * iters_per_epoch
     warmup_iters = cfg["physics_warmup"] * iters_per_epoch
-    display_every = max(1, cfg["log_interval"] * iters_per_epoch)
+    log_every_n_epochs = max(1, int(cfg["log_interval"]))
+    display_every = log_every_n_epochs * iters_per_epoch
+
+    save_best_only = cfg["save_best_checkpoint_only"]
+    print(
+        f"[TRAIN] 验证集: n_test={len(X_test)}（DeepXDE data.test，对应 config 中 test 文件）\n"
+        f"        每 {log_every_n_epochs} 个 epoch 验证一次、写 TensorBoard、"
+        f"{'仅当验证 loss 变好时保存 dde_ckpt' if save_best_only else '每次验证后保存 dde_ckpt'} "
+        f"(ModelCheckpoint period={display_every} iters)"
+    )
 
     model.compile(
         "adam",
@@ -350,15 +362,19 @@ def main():
     )
 
     # ---- Callbacks ----
-    tb_dir = os.path.join(out_dir, "tb")
+    # 每次启动独立子目录，避免多次训练的 tfevents 混在同一 run 里、相同 epoch 互相覆盖，
+    # TensorBoard 看起来像「重启后不更新」。查看时指向 tb 根目录即可对比各次 run_*。
+    tb_root = os.path.join(out_dir, "tb")
+    tb_dir = os.path.join(tb_root, f"run_{time.strftime('%Y%m%d_%H%M%S')}")
     callbacks = [
         PhysicsWarmup(loss_weights, warmup_iters),
         ProgressBar(total_iters, desc="Adam"),
-        TensorBoardCallback(tb_dir),
+        TensorBoardCallback(tb_dir, iters_per_epoch=iters_per_epoch),
         dde.callbacks.ModelCheckpoint(
             os.path.join(out_dir, "dde_ckpt"),
-            save_better_only=True,
+            save_better_only=save_best_only,
             period=display_every,
+            monitor="test loss",
         ),
         dde.callbacks.VariableValue(
             ext_vars,
@@ -367,7 +383,8 @@ def main():
             precision=8,
         ),
     ]
-    print(f"[TB] TensorBoard log → {tb_dir}")
+    print(f"[TB] 本次日志目录: {tb_dir}")
+    print(f"[TB] 启动查看: tensorboard --logdir {tb_root}")
 
     # ---- 第一阶段: Adam ----
     print(f"\n[TRAIN] Adam × {total_iters} iters "
@@ -397,6 +414,7 @@ def main():
             display_every=lbfgs_display,
             callbacks=[
                 ProgressBar(lbfgs_iters, desc="L-BFGS"),
+                TensorBoardCallback(tb_dir, iters_per_epoch=0),
                 dde.callbacks.VariableValue(
                     ext_vars, period=lbfgs_display,
                     precision=8,
@@ -406,7 +424,7 @@ def main():
 
     elapsed = time.time() - t0
     print(f"\n[DONE] elapsed={elapsed:.1f}s")
-    print(f"[TB] tensorboard --logdir {tb_dir}")
+    print(f"[TB] tensorboard --logdir {tb_root}  （本次 run: {tb_dir}）")
 
     # ---- 保存完整检查点 (兼容 eval/plot) ----
     meta = {
