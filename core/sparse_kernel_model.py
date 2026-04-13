@@ -25,9 +25,9 @@ class SparseKernelRbfModel:
 
     def predict_delta6(self, X_raw: np.ndarray, chunk: int = 50000) -> np.ndarray:
         """
-        X_raw: (N,7) where last dim is temperature, first 6 dims are raw6.
+        X_raw: (N,7) 为 [raw6, T]；若模型为 8 维（训练时拼过 ``Tdot``），则为 (N,8)。
         Returns:
-          delta6_pred: (N,6) in original LSB units.
+          delta6_pred: (N,6) LSB。
         """
         X_scaled = (X_raw - self.x_mean[None, :]) / self.x_std[None, :]
         N = X_scaled.shape[0]
@@ -71,8 +71,9 @@ def load_model_json(model_path: str) -> SparseKernelRbfModel:
 
 
 def export_model_json(model: SparseKernelRbfModel, meta: dict, export_path: str) -> None:
+    d_in = int(model.x_mean.shape[0])
     payload = {
-        "input_dim": 7,
+        "input_dim": d_in,
         "output_dim": 6,
         "sigma": float(model.sigma),
         "x_mean": model.x_mean.tolist(),

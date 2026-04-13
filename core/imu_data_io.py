@@ -112,6 +112,25 @@ def split_train_test_by_random_file(data_dir: str, seed: int) -> tuple[list[str]
     return train_paths, test_path, meta
 
 
+def test_path_from_split_meta(meta: dict[str, Any]) -> tuple[str, str]:
+    """从 ``train_test_split.json`` 解析测试文件路径与展示用说明（与 eval 脚本一致）。"""
+    if "test_file" in meta:
+        return meta["test_file"], str(meta.get("test_basename", ""))
+    tfs = meta.get("test_files") or []
+    if not tfs:
+        raise KeyError(
+            "train_test_split.json 中缺少 test_file 或 test_files，请检查训练是否写出划分文件"
+        )
+    test_path = tfs[0]
+    tbn = meta.get("test_basenames") or []
+    note_suffix = tbn[0] if tbn else os.path.basename(test_path)
+    if len(tfs) > 1:
+        note_suffix += (
+            f" (test_files 共 {len(tfs)} 个，本脚本默认只评测第一个；可用 --test_data_path 指定)"
+        )
+    return test_path, note_suffix
+
+
 def save_split_meta(meta: dict[str, Any], out_path: str) -> None:
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:

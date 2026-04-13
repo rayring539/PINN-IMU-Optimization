@@ -18,18 +18,11 @@ import sys
 import numpy as np
 import torch
 
-from core.data_pipeline import parse_data_file
+from core.data_pipeline import compute_dTdt, parse_data_file
+from core.imu_data_io import test_path_from_split_meta
 from core.pinn_metrics import summarize_delta_metrics
 from core.pinn_dde import load_eval_checkpoint
 from core.pinn_model import ACC_SCALE, GYRO_SCALE, TEMP_SCALE, PINN_IMU
-
-
-def compute_dTdt(T: np.ndarray) -> np.ndarray:
-    dT = np.zeros_like(T)
-    dT[1:-1] = (T[2:] - T[:-2]) / 2.0
-    dT[0]    = T[1] - T[0] if len(T) > 1 else 0.0
-    dT[-1]   = T[-1] - T[-2] if len(T) > 1 else 0.0
-    return dT.reshape(-1, 1)
 
 
 def mae_rmse(a: np.ndarray, b: np.ndarray):
@@ -39,23 +32,6 @@ def mae_rmse(a: np.ndarray, b: np.ndarray):
 
 def coverage(ct: np.ndarray, cp: np.ndarray, eps: float):
     return np.mean(np.abs(cp - ct) <= eps, axis=0).tolist()
-
-
-def _test_path_from_split_meta(meta: dict) -> tuple[str, str]:
-    """兼容旧字段 ``test_file`` 与 ``imu_data_io`` 写入的 ``test_files``。"""
-    if "test_file" in meta:
-        return meta["test_file"], str(meta.get("test_basename", ""))
-    tfs = meta.get("test_files") or []
-    if not tfs:
-        raise KeyError(
-            "train_test_split.json 中缺少 test_file 或 test_files，请检查训练是否写出划分文件"
-        )
-    test_path = tfs[0]
-    tbn = meta.get("test_basenames") or []
-    note_suffix = tbn[0] if tbn else os.path.basename(test_path)
-    if len(tfs) > 1:
-        note_suffix += f" (test_files 共 {len(tfs)} 个，本脚本默认只评测第一个；可用 --test_data_path 指定)"
-    return test_path, note_suffix
 
 
 def main():
@@ -89,7 +65,7 @@ def main():
     else:
         with open(args.split_meta, "r", encoding="utf-8") as f:
             meta = json.load(f)
-        test_path, test_meta_note = _test_path_from_split_meta(meta)
+        test_path, test_meta_note = test_path_from_split_meta(meta)
         split_note = f"split_meta test={test_meta_note}"
 
     if not os.path.isfile(args.model_path):
@@ -233,9 +209,10 @@ def main():
     print("[INFO] eval result:\n" + json.dumps(result, ensure_ascii=False, indent=2))
 
     safe = os.path.splitext(os.path.basename(test_path))[0]
+    model_stem = os.path.splitext(os.path.basename(args.model_path))[0]
     out_path = os.path.join(
         os.path.dirname(args.model_path) or "outputs_pinn",
-        f"pinn_eval_bad{bad_x}_eps{args.eps}_test_{safe}.json",
+        f"pinn_eval_{model_stem}_bad{bad_x}_eps{args.eps}_test_{safe}.json",
     )
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:

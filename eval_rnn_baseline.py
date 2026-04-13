@@ -1,10 +1,9 @@
 """
-稀疏核岭回归基线评测 —— 与 eval_pinn 相同测试集与指标（δ LSB、coverage）。
+RNN 基线评测 —— 与 ``eval_sparse_kernel`` / ``eval_pinn`` 相同测试集与 δ 指标。
 
 用法:
-  python eval_sparse_kernel.py --model_path outputs_pinn/sparse_kernel_model.json \\
-      --split_meta outputs_pinn/train_test_split.json
-  python eval_sparse_kernel.py --model_path outputs/sparse_kernel_model.json --test_data_path /path/to/5.txt
+  python eval_rnn_baseline.py --model_path outputs_pinn/rnn_baseline.pt \\
+      --split_meta outputs_pinn/train_test_split.json --device cuda
 """
 from __future__ import annotations
 
@@ -22,7 +21,7 @@ if _REPO not in sys.path:
 from core.data_pipeline import compute_dTdt, parse_data_file, stratified_split_by_temp_bin_round_int
 from core.imu_data_io import test_path_from_split_meta
 from core.pinn_metrics import summarize_delta_metrics
-from core.sparse_kernel_model import load_model_json
+from core.rnn_imu_baseline import load_checkpoint, predict_delta6_sequence
 
 
 def mae_rmse(a: np.ndarray, b: np.ndarray):
@@ -35,31 +34,29 @@ def coverage_within_threshold(corrected_true: np.ndarray, corrected_pred: np.nda
     return np.mean(err <= eps, axis=0).tolist()
 
 
-def _input_dim_from_model(path: str) -> int:
-    with open(path, "r", encoding="utf-8") as f:
-        obj = json.load(f)
-    return int(obj.get("input_dim", len(obj["x_mean"])))
-
-
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model_path", default=os.path.join("outputs_pinn", "sparse_kernel_model.json"))
+    ap.add_argument("--model_path", default=os.path.join("outputs_pinn", "rnn_baseline.pt"))
     ap.add_argument("--split_meta", default=os.path.join("outputs_pinn", "train_test_split.json"))
     ap.add_argument("--test_data_path", default=None)
-    ap.add_argument("--data_path", default=None, help="单文件评测（与 PINN eval 的 legacy 一致）")
+    ap.add_argument("--data_path", default=None)
     ap.add_argument("--N_used", type=int, default=-1)
     ap.add_argument("--test_ratio", type=float, default=0.2)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--eps", type=float, default=5.0)
     ap.add_argument("--bad_x", type=float, default=None)
+    ap.add_argument("--device", default=None)
     args = ap.parse_args()
 
     if not os.path.isfile(args.model_path):
         print(f"[ERROR] 找不到模型: {args.model_path}", file=sys.stderr)
         sys.exit(1)
 
-    d_in = _input_dim_from_model(args.model_path)
-    use_dTdt = d_in >= 8
+    dev = args.device or ("cuda" if __import__("torch").cuda.is_available() else "cpu")
+    model, meta = load_checkpoint(args.model_path, map_location=dev)
+    model.to(dev)
+
+    use_dTdt = bool(meta.get("use_dTdt", meta.get("input_dim", 7) >= 8))
 
     test_path: str | None
     if args.test_data_path:
@@ -74,11 +71,9 @@ def main():
         test_path = None
     else:
         with open(args.split_meta, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-        test_path, note = test_path_from_split_meta(meta)
+            smeta = json.load(f)
+        test_path, note = test_path_from_split_meta(smeta)
         split_note = f"split_meta test={note}"
-
-    model = load_model_json(args.model_path)
 
     if test_path is not None:
         n_lines = None if args.N_used < 0 else args.N_used
@@ -90,7 +85,8 @@ def main():
     else:
         X_in = X_test.astype(np.float64)
 
-    y_delta_pred = model.predict_delta6(X_in)
+    # meta 中 x_mean 等可能为 list（来自 json）；predict 内会 np.asarray
+    y_delta_pred = predict_delta6_sequence(model, X_in, meta, device=dev)
 
     raw6 = X_test[:, :6]
     corrected_true = raw6 + y_delta_test
@@ -105,8 +101,7 @@ def main():
         "model_path": args.model_path,
         "split_type": split_note,
         "test_data_path": test_path if test_path is not None else args.data_path,
-        "input_dim": d_in,
-        "use_dTdt": use_dTdt,
+        "rnn_meta": {k: meta[k] for k in ("seq_len", "rnn_type", "hidden_dim", "input_dim", "use_dTdt") if k in meta},
         "N_used": int(args.N_used),
         "eps": float(args.eps),
         "bad_x": bad_x,
@@ -116,14 +111,15 @@ def main():
         "N_test": int(len(X_test)),
     }
 
-    print("[INFO] eval result:\n" + json.dumps(result, ensure_ascii=False, indent=2))
+    print("[INFO] eval result:\n" + json.dumps(result, ensure_ascii=False, indent=2, default=str))
 
     safe = os.path.splitext(os.path.basename(test_path if test_path else args.data_path or "test"))[0]
+    model_stem = os.path.splitext(os.path.basename(args.model_path))[0]
     out_dir = os.path.dirname(args.model_path) or "outputs_pinn"
-    out_path = os.path.join(out_dir, f"sparse_kernel_eval_bad{bad_x}_eps{args.eps}_test_{safe}.json")
+    out_path = os.path.join(out_dir, f"rnn_eval_{model_stem}_bad{bad_x}_eps{args.eps}_test_{safe}.json")
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
+        json.dump(result, f, ensure_ascii=False, indent=2, default=str)
     print(f"[INFO] saved: {out_path}")
 
 

@@ -1,14 +1,14 @@
 {
   "split_mode": "explicit",
-  "data_dir": "/path/to/IMU_data",
+  "data_dir": "/home/leiyilin/IMU_data",
   "train_files": [
-    "/path/to/IMU_data/1.txt",
-    "/path/to/IMU_data/2.txt",
-    "/path/to/IMU_data/3.txt",
-    "/path/to/IMU_data/4.txt"
+    "/home/leiyilin/IMU_data/1.txt",
+    "/home/leiyilin/IMU_data/2.txt",
+    "/home/leiyilin/IMU_data/3.txt",
+    "/home/leiyilin/IMU_data/4.txt"
   ],
   "test_files": [
-    "/path/to/IMU_data/5.txt"
+    "/home/leiyilin/IMU_data/5.txt"
   ],
   "train_basenames": [
     "1.txt",

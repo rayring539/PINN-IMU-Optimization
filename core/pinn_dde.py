@@ -201,9 +201,12 @@ class IMUNet(dde.nn.NN):
 class IMUPINNData(dde.data.DataSet):
     """DataSet that augments the data MSE with 8 physics-informed loss terms.
 
-    losses() 返回 9 个标量张量:
+    ``losses()``（训练）返回 9 个标量张量:
       [L_data, L_heat_smooth, L_physics_prior, L_stiffness_mono,
        L_acc_tdb, L_three_factor, L_gyro_smooth, L_residual_small, L_grad_smooth]
+
+    ``losses_test()``（验证）为省算力只对测试集算 data + prior + residual_small，
+    其余项填 0，故 TB 中 ``val/heat_smooth`` 等为 0 属预期。
     """
 
     def __init__(self, X_train, y_train, X_test, y_test):
@@ -296,7 +299,16 @@ class IMUPINNData(dde.data.DataSet):
                 L_tdb, L_3f, L_gyro, L_res, L_grad]
 
     def losses_test(self, targets, outputs, loss_fn, inputs, model, aux=None):
-        """测试阶段只算数据损失 + 简单物理项 (跳过耗时的高阶梯度)。"""
+        """验证集损失：返回与 ``losses`` 相同长度的 9 项，但 **多数物理项置 0**。
+
+        仅计算：数据 MSE、物理先验 ``L_prior``、残差幅度 ``L_res``。
+        **不计算**（置 0）：``L_heat_smooth``、``L_stiffness_mono``、``L_acc_tdb``、
+        ``L_three_factor``、``L_gyro_smooth``、``L_grad_smooth``——避免对整份
+        ``X_test`` 做 Hessian / 高阶梯度（过慢）。
+
+        因此 TensorBoard 里 ``val/heat_smooth`` 等恒为 0 **是当前设计**，
+        不代表训练步中未使用该项；看物理项请用 ``train/heat_smooth`` 等。
+        """
         net = unwrap_parallel_net(model.net)
         asc, gsc = net.acc_scale, net.gyro_scale
         dev = outputs.device
@@ -398,7 +410,8 @@ class TensorBoardCallback(dde.callbacks.Callback):
     - **train/***  每个优化步写一次（从 ``model._step_losses`` 读取，由 ``Model._compile_pytorch`` 在
       ``train_step`` 的 closure 里写入）
     - **val/***    验证步：``losses_test`` 分项；若 ``model.compile(metrics=...)`` 则另有 6 轴
-      ``rmse_*`` / ``bad_*``、``rmse_total``、``bad_total``（与 ``training.val_bad_threshold`` 一致）。
+      ``rmse_*``、``armse``、``g_rmse``、``bad_*``、``rmse_total``、``bad_total``
+      （与 ``training.val_bad_threshold`` 一致）。
 
     横坐标 = ``train_state.step``（优化步）。需配合 ``deepxde`` 中已打补丁的 ``_step_losses``。
     """

@@ -7,6 +7,15 @@ import numpy as np
 IDEAL6 = np.array([0.0, 0.0, 2048.0, 0.0, 0.0, 0.0], dtype=np.float64)
 
 
+def compute_dTdt(T: np.ndarray) -> np.ndarray:
+    """温度列 T_raw（与 ``parse_data_file`` 第 7 列一致）的差分，形状 (N,1)。"""
+    dT = np.zeros_like(T)
+    dT[1:-1] = (T[2:] - T[:-2]) / 2.0
+    dT[0] = T[1] - T[0] if len(T) > 1 else 0.0
+    dT[-1] = T[-1] - T[-2] if len(T) > 1 else 0.0
+    return dT.reshape(-1, 1)
+
+
 def parse_data_file(data_path: str, n_lines: int | None = None):
     """
     Read 7-col numeric file (no header).

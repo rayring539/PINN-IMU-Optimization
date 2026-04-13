@@ -38,6 +38,10 @@ IMU/
 ├── tools/                    # 画图、ONNX 导出脚本等
 ├── train_pinn.py             # PyTorch 训练入口
 ├── train_pinn_dde.py         # DeepXDE 训练入口（推荐）
+├── train_sparse_kernel.py    # 稀疏 RBF 核岭回归基线（可与同一 YAML 数据划分）
+├── train_rnn_baseline.py     # LSTM/GRU 序列基线（与同一 YAML 数据划分）
+├── eval_sparse_kernel.py
+├── eval_rnn_baseline.py
 └── eval_pinn.py / eval_*.py
 ```
 
@@ -83,6 +87,30 @@ python tools/plot_pinn_results.py --model_path <out_dir>/pinn_model_best.pt --sp
 
 仓库中 `outputs_pinn/` 下可提交 **JSON**（`train_config.json`、`train_test_split.json`、评测摘要等）；**`.pt` / TensorBoard** 仍被忽略，需在本地训练生成。
 
+### 3.1 核岭回归基线（与 PINN 相同数据）
+
+使用与 PINN 相同的 `config/pinn_train.yaml`（`data_dir`、explicit 划分、`model.use_dTdt` 决定是否拼 `Tdot`）：
+
+```bash
+python train_sparse_kernel.py --config config/pinn_train.yaml
+# 产出默认: <output.out_dir>/sparse_kernel_model.json ，并写出 train_test_split.json
+
+python eval_sparse_kernel.py --model_path outputs_pinn/sparse_kernel_model.json \\
+    --split_meta outputs_pinn/train_test_split.json
+```
+
+### 3.2 RNN 基线（LSTM/GRU，与 PINN 相同数据）
+
+与 `train_sparse_kernel.py` 一样使用 `config/pinn_train.yaml`（`data_dir`、explicit 划分、`model.use_dTdt` 决定是否拼 `Tdot`）。默认产出 `<output.out_dir>/rnn_baseline.pt` 及同目录 `*_meta.json`。
+
+```bash
+python train_rnn_baseline.py --config config/pinn_train.yaml
+# 可选: --rnn_type lstm --hidden_dim 128 --seq_len 32 --epochs 50
+
+python eval_rnn_baseline.py --model_path outputs_pinn/rnn_baseline.pt \\
+    --split_meta outputs_pinn/train_test_split.json
+```
+
 ### 4. 仅导出 ONNX（已有 checkpoint）
 
 ```bash
@@ -100,7 +128,7 @@ tensorboard --logdir <out_dir>/tb
 | 标量组 | 含义 | 说明 |
 |--------|------|------|
 | `train/*` | 训练 batch 各 loss 分项、`train/total`、`train/lr` | DeepXDE（`train_pinn_dde.py`）：每优化步写入，来自 `model._step_losses`；纯 PyTorch：`train_pinn.py` 另有 `train/data`、`train/physics_*` 等 |
-| `val/*` | 验证集 | DeepXDE：`losses_test` 各分项 + 6 轴 `rmse_ax`…`rmse_gz`、`bad_ax`…`bad_gz`、`rmse_total`、`bad_total`（阈值 `training.val_bad_threshold`）；写入频率由 `log_interval`→`display_every` 决定 |
+| `val/*` | 验证集 | DeepXDE：`losses_test` 各分项 + 6 轴 `rmse_*` + `armse`（加计三轴块 RMSE）+ `g_rmse`（陀螺三轴块 RMSE）+ `bad_*`、`rmse_total`、`bad_total`（阈值 `training.val_bad_threshold`）；写入频率由 `log_interval`→`display_every` 决定 |
 | `meta/epoch` | 近似 epoch（步数 / `iters_per_epoch`） | 仅 DeepXDE Adam 阶段且 `iters_per_epoch>0` 时写入 |
 | `test/*` | 仅 `train_pinn.py` | 如 `test/rmse_lsb` 等 |
 

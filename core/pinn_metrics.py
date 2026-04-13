@@ -59,7 +59,11 @@ def summarize_delta_metrics(
 
 
 def make_delta_val_metrics(bad_threshold: float) -> tuple[list, tuple[str, ...]]:
-    """供 DeepXDE ``model.compile(..., metrics=...)``：14 个标量 + 名称元组。"""
+    """供 DeepXDE ``model.compile(..., metrics=...)``：标量 + 名称元组。
+
+    含加计/陀螺 **三块合并 RMSE**（``armse`` / ``g_rmse``）：对对应列所有 N×3 元素
+    取均方再开方（LSB），TensorBoard 中为 ``val/armse``、``val/g_rmse``。
+    """
     th = float(bad_threshold)
     metrics: list = []
 
@@ -68,6 +72,16 @@ def make_delta_val_metrics(bad_threshold: float) -> tuple[list, tuple[str, ...]]
             return float(np.sqrt(np.mean((yp[:, axis] - yt[:, axis]) ** 2)))
 
         metrics.append(_rmse_i)
+
+    def _rmse_acc_block(yt, yp):
+        e = yp[:, :3] - yt[:, :3]
+        return float(np.sqrt(np.mean(e ** 2)))
+
+    def _rmse_gyro_block(yt, yp):
+        e = yp[:, 3:6] - yt[:, 3:6]
+        return float(np.sqrt(np.mean(e ** 2)))
+
+    metrics.extend([_rmse_acc_block, _rmse_gyro_block])
 
     for i in range(6):
         def _bad_i(yt, yp, axis=i):
@@ -86,6 +100,7 @@ def make_delta_val_metrics(bad_threshold: float) -> tuple[list, tuple[str, ...]]
 
     names = (
         tuple(f"rmse_{AXIS_NAMES[i]}" for i in range(6))
+        + ("armse", "g_rmse")
         + tuple(f"bad_{AXIS_NAMES[i]}" for i in range(6))
         + ("rmse_total", "bad_total")
     )
@@ -95,6 +110,7 @@ def make_delta_val_metrics(bad_threshold: float) -> tuple[list, tuple[str, ...]]
 # 默认与 make_delta_val_metrics 返回顺序一致
 VAL_METRIC_NAMES = (
     tuple(f"rmse_{AXIS_NAMES[i]}" for i in range(6))
+    + ("armse", "g_rmse")
     + tuple(f"bad_{AXIS_NAMES[i]}" for i in range(6))
     + ("rmse_total", "bad_total")
 )

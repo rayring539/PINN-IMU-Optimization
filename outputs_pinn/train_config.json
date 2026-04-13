@@ -1,5 +1,5 @@
 {
-  "data_dir": "/path/to/IMU_data",
+  "data_dir": "/home/leiyilin/IMU_data",
   "data_path": null,
   "N_used": -1,
   "test_ratio": 0.2,
