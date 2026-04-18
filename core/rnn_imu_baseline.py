@@ -15,7 +15,10 @@ import torch.nn as nn
 
 
 class IMURNNBaseline(nn.Module):
-    """(B, T, D) → (B, 6)，取 RNN 最后一步隐状态后接 Linear。"""
+    """(B, T, D) → (B, 6)，取 RNN 最后一步输出后接 Linear。
+
+    ``bidirectional=True`` 时为 BiLSTM/BiGRU，最后一步拼接正反方向，特征维为 ``hidden_dim*2``。
+    """
 
     def __init__(
         self,
@@ -24,11 +27,13 @@ class IMURNNBaseline(nn.Module):
         num_layers: int = 2,
         rnn_type: str = "LSTM",
         dropout: float = 0.0,
+        bidirectional: bool = False,
     ):
         super().__init__()
         self.input_dim = int(input_dim)
         self.hidden_dim = int(hidden_dim)
         self.num_layers = int(num_layers)
+        self.bidirectional = bool(bidirectional)
         rnn_type = str(rnn_type).upper()
         self.rnn_type = "GRU" if rnn_type == "GRU" else "LSTM"
         klass = nn.GRU if self.rnn_type == "GRU" else nn.LSTM
@@ -38,8 +43,10 @@ class IMURNNBaseline(nn.Module):
             num_layers,
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=self.bidirectional,
         )
-        self.head = nn.Linear(hidden_dim, 6)
+        out_dim = hidden_dim * (2 if self.bidirectional else 1)
+        self.head = nn.Linear(out_dim, 6)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, T, D)
@@ -54,7 +61,9 @@ def _pad_window(X: np.ndarray, i: int, seq_len: int) -> np.ndarray:
     if start >= 0:
         return X[start : i + 1].copy()
     chunk = X[: i + 1]
-    pad = np.tile(chunk[0:1], (seq_len - len(chunk), X.shape[1]))
+    # reps 第二维须为 1；误用 X.shape[1] 会在特征维上重复 tile，例如 D=8 → 宽 64
+    need = seq_len - len(chunk)
+    pad = np.tile(chunk[0:1], (need, 1))
     return np.vstack([pad, chunk])
 
 
@@ -104,7 +113,15 @@ def save_checkpoint(
     torch.save({"state_dict": model.state_dict(), "meta": meta}, path)
 
 
+def _normalize_cuda_device_str(loc: str | torch.device) -> str | torch.device:
+    """将误输入的全角冒号 ``：``（U+FF1A）改为 ASCII ``:``，避免 ``cuda：1`` 无效。"""
+    if isinstance(loc, str):
+        return loc.replace("：", ":").strip()
+    return loc
+
+
 def load_checkpoint(path: str, map_location: str | torch.device = "cpu") -> tuple[IMURNNBaseline, dict[str, Any]]:
+    map_location = _normalize_cuda_device_str(map_location)
     blob = torch.load(path, map_location=map_location, weights_only=False)
     meta = blob["meta"]
     m = IMURNNBaseline(
@@ -113,6 +130,7 @@ def load_checkpoint(path: str, map_location: str | torch.device = "cpu") -> tupl
         num_layers=int(meta.get("num_layers", 2)),
         rnn_type=str(meta.get("rnn_type", "LSTM")),
         dropout=float(meta.get("dropout", 0.0)),
+        bidirectional=bool(meta.get("bidirectional", False)),
     )
     m.load_state_dict(blob["state_dict"])
     return m, meta

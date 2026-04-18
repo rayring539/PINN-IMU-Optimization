@@ -189,3 +189,47 @@ def load_xy_train_test_from_dir(cfg: dict):
         ty.append(y)
     X_test, y_test = np.concatenate(tx), np.concatenate(ty)
     return X_train, y_train, X_test, y_test, split_meta
+
+
+def load_xy_train_only_from_dir(cfg: dict):
+    """仅读取 ``train_files`` 并拼接，不读测试文件；仍写出 ``train_test_split.json`` 与完整划分元数据。
+
+    用于 RNN 等：从训练文件中再划出一部分作验证，避免在训练阶段读取大测试集。
+    """
+    from core.data_pipeline import parse_data_file
+
+    data_dir = cfg["data_dir"]
+    os.makedirs(cfg["out_dir"], exist_ok=True)
+    split_json = os.path.join(cfg["out_dir"], "train_test_split.json")
+
+    if cfg.get("split_mode") == "explicit":
+        train_paths, test_paths, split_meta = split_train_test_explicit(
+            data_dir, cfg["train_files"], cfg["test_files"]
+        )
+        save_split_meta(split_meta, split_json)
+        print(
+            f"[SPLIT] explicit (train-only) train={split_meta['train_basenames']}  "
+            f"test={split_meta['test_basenames']} [测试文件本次未加载]"
+        )
+    else:
+        train_paths, test_path, split_meta = split_train_test_by_random_file(
+            data_dir, seed=cfg["seed"]
+        )
+        save_split_meta(split_meta, split_json)
+        print(
+            f"[SPLIT] random (train-only) test={split_meta['test_basename']}  "
+            f"train={split_meta['train_basenames']} [测试文件本次未加载]"
+        )
+
+    xs, ys, total = [], [], 0
+    n_limit = cfg["N_used"]
+    for fp in train_paths:
+        remain = None if n_limit < 0 else max(0, n_limit - total)
+        if remain is not None and remain <= 0:
+            break
+        xf, yf = parse_data_file(fp, n_lines=remain)
+        xs.append(xf)
+        ys.append(yf)
+        total += len(xf)
+    X_train, y_train = np.concatenate(xs), np.concatenate(ys)
+    return X_train, y_train, split_meta

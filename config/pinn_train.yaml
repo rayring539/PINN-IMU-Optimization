@@ -1,5 +1,6 @@
 # =============================================================================
 #  PINN 训练配置（PyTorch: train_pinn.py / DeepXDE: train_pinn_dde.py）
+#  RNN 基线超参见下方 rnn_baseline（train_rnn_baseline.py）
 #  用法:
 #    python train_pinn_dde.py --config config/pinn_train.yaml
 #    python train_pinn.py --config config/pinn_train.yaml
@@ -33,7 +34,7 @@ sensor:
 
 # ---- 网络 ----
 model:
-  hidden_dim: 32              # 残差分支宽度（边缘可 32，服务器可 64）
+  hidden_dim: 64              # 残差分支宽度（边缘可 32，服务器可 64）
   n_hidden: 3                 # 残差分支层数
   thermal_dim: 16             # 热特征维度
   act: "tanh"
@@ -43,6 +44,45 @@ model:
   # false: 残差分支使用 raw6（与当前默认一致）
   # true:  仅依赖温度(及 Ṫ)；残差输入中 raw6_norm 置零，需单独训练/部署，权重与 false 不通用
   temp_only: false
+
+# ---- RNN 基线（仅 train_rnn_baseline.py 读取；PINN 结构字段不受影响）----
+rnn_baseline:
+  rnn_type: LSTM              # LSTM 或 GRU
+  bidirectional: true        # true = BiLSTM / BiGRU（head 输入维 hidden_dim*2）
+  seq_len: 128
+  hidden_dim: 128
+  num_layers: 2
+  dropout: 0.0
+  epochs: 100
+  batch_size: 512
+  lr: 1.0e-3
+  weight_decay: 1.0e-5
+  # 归一化 δ 监督：mse | smooth_l1（Huber/SmoothL1）
+  loss_type: smooth_l1
+  smooth_l1_beta: 1.0
+  # 逐轴权重 ax,ay,az,gx,gy,gz；训练前会除以均值，使平均权重为 1（便于与旧 MSE 尺度对照）
+  axis_loss_weights: [1.0, 1.0, 1.0, 1.0, 1.5, 1.2]
+  # 学习率策略: none | plateau(验证 loss 无改善则乘 lr_plateau_factor) | cosine | step
+  lr_schedule: plateau
+  lr_plateau_factor: 0.5
+  lr_plateau_patience: 5
+  lr_plateau_min: 1.0e-6
+  lr_cosine_t_max: 100        # 默认等于 epochs；可与 cosine 同时改
+  lr_cosine_eta_min: 1.0e-6
+  lr_step_size: 30
+  lr_step_gamma: 0.5
+  max_train_windows: 500000   # 训练窗口随机子采样上限
+  max_val_windows: 200000      # 验证集窗口子采样上限（打印 val_mse_norm 用）
+  # ---- 验证集来源（仅 train_rnn_baseline）----
+  # test_files: val_mse 用 data.test_files（如 5.txt），训练仍用 train_files
+  # stratified_temp: 仅从 train_files 读入后按温度取整分层留出 val_ratio（推荐：温漂与温度分布相关）
+  # random: 行级随机打乱后留出 val_ratio
+  # temporal_tail: 拼接行序末尾 val_ratio（多文件按 train_files 顺序；适合检验时间外推）
+  val_source: stratified_temp
+  val_ratio: 0.2
+  save_best_val: true         # true 时另存 val_mse_norm 最小对应的权重：<out>_best_val.pt
+  # RNN 使用的 GPU（优先于 training.cuda_device）。若命令行使用 CUDA_VISIBLE_DEVICES=1 只暴露一张卡，进程内应写 cuda:0（脚本会自动把越界的 cuda:k 回退为 cuda:0）
+  device: cuda:1
 
 # ---- 训练（DeepXDE / PyTorch 共用字段）----
 training:

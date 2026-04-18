@@ -42,6 +42,8 @@ IMU/
 ├── train_rnn_baseline.py     # LSTM/GRU 序列基线（与同一 YAML 数据划分）
 ├── eval_sparse_kernel.py
 ├── eval_rnn_baseline.py
+├── eval_hybrid_pinn_rnn.py   # 按轴混合 PINN 与 RNN 的 δ（支持单文件融合模型）
+├── fuse_hybrid_model.py      # 将 PINN+RNN 打成 hybrid_imu_delta.pt 并写入选轴
 └── eval_pinn.py / eval_*.py
 ```
 
@@ -110,6 +112,40 @@ python train_rnn_baseline.py --config config/pinn_train.yaml
 python eval_rnn_baseline.py --model_path outputs_pinn/rnn_baseline.pt \\
     --split_meta outputs_pinn/train_test_split.json
 ```
+
+### 3.3 按轴混合 PINN + RNN（六轴子集）
+
+对每个轴 **ax…gz** 独立选用 PINN 或 RNN 的 δ，再拼成 6 维预测。**推荐**：先用 `fuse_hybrid_model.py` 打成 **单文件** `hybrid_imu_delta.pt`（内嵌 PINN/RNN 权重与 `axis_source`），部署与评测只带一个模型。
+
+**融合（自动选轴可用验证集数据或两份 val 上的 eval JSON）**：
+
+```bash
+python fuse_hybrid_model.py --pinn_path outputs_pinn/dde_ckpt-147070.pt \\
+    --rnn_path outputs_pinn/rnn_baseline.pt \\
+    --out_path outputs_pinn/hybrid_imu_delta.pt \\
+    --val_data_path /path/to/4.txt
+
+# 或: --axis_source pinn,pinn,pinn,rnn,rnn,rnn
+# 或: --auto_from_val_json pinn_val.json rnn_val.json
+```
+
+**评测（单文件）**：
+
+```bash
+python eval_hybrid_pinn_rnn.py --model_path outputs_pinn/hybrid_imu_delta.pt \\
+    --split_meta outputs_pinn/train_test_split.json
+```
+
+**双 checkpoint 直连评测**（与旧版相同）：
+
+```bash
+python eval_hybrid_pinn_rnn.py --pinn_path outputs_pinn/dde_ckpt-147070.pt \\
+    --rnn_path outputs_pinn/rnn_baseline.pt \\
+    --split_meta outputs_pinn/train_test_split.json \\
+    --axis_source pinn,pinn,pinn,rnn,rnn,rnn
+```
+
+RNN 训练超参见 `config/pinn_train.yaml` 中 **`rnn_baseline`**；命令行参数可覆盖 YAML。
 
 ### 4. 仅导出 ONNX（已有 checkpoint）
 

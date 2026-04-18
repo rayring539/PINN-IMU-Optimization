@@ -90,3 +90,27 @@ def stratified_split_by_temp_bin_round_int(X_raw: np.ndarray, y: np.ndarray, tes
     X_train_raw, y_train = X_raw[train_mask], y[train_mask]
     X_test, y_test = X_raw[test_mask], y[test_mask]
     return X_train_raw, y_train, X_test, y_test
+
+
+def split_train_val_random_rows(
+    X_raw: np.ndarray, y: np.ndarray, val_ratio: float, seed: int
+):
+    """从同一段数据中随机划分验证集（行级打乱）。"""
+    rng = np.random.default_rng(seed)
+    n = X_raw.shape[0]
+    n_val = max(1, int(round(n * float(val_ratio))))
+    if n_val >= n:
+        n_val = max(1, n - 1)
+    perm = rng.permutation(n)
+    val_idx = perm[:n_val]
+    tr_idx = perm[n_val:]
+    return X_raw[tr_idx], y[tr_idx], X_raw[val_idx], y[val_idx]
+
+
+def split_train_val_temporal_tail(X_raw: np.ndarray, y: np.ndarray, val_ratio: float):
+    """按拼接后的行序取末尾 ``val_ratio`` 为验证集（假设时间单调；多文件按 train_files 顺序拼接）。"""
+    n = X_raw.shape[0]
+    n_val = max(1, int(round(n * float(val_ratio))))
+    if n_val >= n:
+        n_val = max(1, n // 5)
+    return X_raw[:-n_val], y[:-n_val], X_raw[-n_val:], y[-n_val:]
